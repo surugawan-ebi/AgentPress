@@ -1,17 +1,35 @@
 {
   "name": "agentpress",
   "version": "0.1.0",
-  "description": "A Git-style review queue for the knowledge your AI agents are allowed to cite.",
+  "description": "A Git-style review queue for the knowledge your AI agents are allowed to cite. MCP server + CLI for approval-first agent knowledge management.",
   "type": "module",
   "license": "Apache-2.0",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "ai-agents",
+    "knowledge-base",
+    "knowledge-management",
+    "review-workflow",
+    "verified-context",
+    "cli",
+    "sqlite"
+  ],
   "bin": {
     "agentpress": "dist/cli/index.js"
   },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
   "files": [
     "dist",
-    "examples"
+    "README.md",
+    "LICENSE"
   ],
   "engines": {
     "node": ">=20"
@@ -20,7 +38,8 @@
     "build": "tsc",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "smoke": "node scripts/smoke-mcp.mjs"
+    "smoke": "node scripts/smoke-mcp.mjs",
+    "prepublishOnly": "npm run build && npm test"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1",
