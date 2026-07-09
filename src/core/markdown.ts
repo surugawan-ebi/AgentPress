@@ -16,6 +16,7 @@ import {
   toDetail,
   replaceTags,
   replaceSources,
+  buildNoteSnapshot,
   slugify,
   resolveUniqueSlug,
   rowToNote,
@@ -254,7 +255,7 @@ export function importPath(ctx: AppContext, inputPath: string, opts: ImportOptio
     proposalIds: [],
   };
 
-  function tryVerifyImportedDraft(noteId: string): { verified: boolean; reason?: string } {
+  function tryVerifyImportedDraft(noteId: string): { verified: boolean; reason?: string; warnings?: PolicyWarning[] } {
     const note = getNoteRow(db, noteId);
     if (!note) return { verified: false, reason: "note disappeared during import" };
     const sources = getSources(db, noteId).map((s) => ({ type: s.type }));
@@ -266,32 +267,49 @@ export function importPath(ctx: AppContext, inputPath: string, opts: ImportOptio
       return { verified: false, reason: `missing required field(s): ${missing.join(", ")}` };
     }
 
-    const now = new Date().toISOString();
-    const reviewDueAt = policy.computeReviewDueAt(now);
-    const updated: NoteRow = {
-      ...note,
-      status: "verified",
-      verified_at: now,
-      review_due_at: reviewDueAt,
-      reviewed_by: actor,
-      updated_at: now,
-    };
-    db.prepare(
-      `UPDATE notes SET status=@status, verified_at=@verified_at, review_due_at=@review_due_at,
-         reviewed_by=@reviewed_by, updated_at=@updated_at WHERE id=@id`,
-    ).run(updated);
-    history.record({
-      entityType: "note",
-      entityId: noteId,
-      eventType: "note_verified",
-      actor,
-      role,
-      scope: note.scope,
-      reason: "verified on import (--verified)",
-      beforeSnapshot: { note },
-      afterSnapshot: { note: updated },
+    // required_fields_for_verify passed; still run the full approve-time policy check (the
+    // same one a human `agentpress approve` would trigger) so e.g. reviewer_separation --
+    // always true here, since the importer is necessarily also created_by for a brand-new
+    // note -- surfaces in the import summary instead of silently skipping it.
+    const approveWarnings = policy.checkApprove({
+      kind: "note",
+      authorActor: note.created_by,
+      confidence: note.confidence as Confidence,
+      owner: note.owner,
+      sources,
     });
-    return { verified: true };
+
+    const now = new Date().toISOString();
+    const runVerify = db.transaction(() => {
+      const beforeSnapshot = buildNoteSnapshot(db, note);
+      const reviewDueAt = policy.computeReviewDueAt(now);
+      const updated: NoteRow = {
+        ...note,
+        status: "verified",
+        verified_at: now,
+        review_due_at: reviewDueAt,
+        reviewed_by: actor,
+        updated_at: now,
+      };
+      db.prepare(
+        `UPDATE notes SET status=@status, verified_at=@verified_at, review_due_at=@review_due_at,
+           reviewed_by=@reviewed_by, updated_at=@updated_at WHERE id=@id`,
+      ).run(updated);
+      history.record({
+        entityType: "note",
+        entityId: noteId,
+        eventType: "note_verified",
+        actor,
+        role,
+        scope: note.scope,
+        reason: "verified on import (--verified)",
+        beforeSnapshot,
+        afterSnapshot: buildNoteSnapshot(db, updated),
+      });
+    });
+    runVerify();
+
+    return { verified: true, warnings: approveWarnings.length > 0 ? approveWarnings : undefined };
   }
 
   function insertNewNote(explicitId: string | undefined, fields: ParsedFields, file: string): { note: Note; policyWarnings: PolicyWarning[] } {
@@ -353,12 +371,14 @@ export function importPath(ctx: AppContext, inputPath: string, opts: ImportOptio
       role,
       scope,
       reason: `imported from ${file}`,
-      afterSnapshot: { note: row, tags, sources: source },
+      afterSnapshot: buildNoteSnapshot(db, row),
     });
     return { note: rowToNote(row), policyWarnings };
   }
 
   function updateExistingDraft(existing: NoteRow, fields: ParsedFields): PolicyWarning[] {
+    // Captured before any mutation below, for the history beforeSnapshot.
+    const beforeSnapshot = buildNoteSnapshot(db, existing);
     // Fields omitted from frontmatter keep the draft's current value (a partial
     // hand-edit shouldn't silently blank out title/summary/tags/sources/etc).
     const title = fields.title ?? existing.title;
@@ -408,8 +428,8 @@ export function importPath(ctx: AppContext, inputPath: string, opts: ImportOptio
       role,
       scope,
       reason: "imported from markdown",
-      beforeSnapshot: { note: existing },
-      afterSnapshot: { note: updated },
+      beforeSnapshot,
+      afterSnapshot: buildNoteSnapshot(db, updated),
     });
     return policyWarnings;
   }
@@ -429,6 +449,11 @@ export function importPath(ctx: AppContext, inputPath: string, opts: ImportOptio
         const outcome = tryVerifyImportedDraft(note.id);
         if (!outcome.verified) {
           summary.warnings.push({ file, message: `created as draft (could not verify: ${outcome.reason})` });
+        } else if (outcome.warnings && outcome.warnings.length > 0) {
+          summary.warnings.push({
+            file,
+            message: `verified with policy warnings: ${outcome.warnings.map((w) => w.code).join(", ")}`,
+          });
         }
       }
       return;

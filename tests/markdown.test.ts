@@ -271,4 +271,64 @@ describe("importPath", () => {
     expect(created?.status).toBe("draft");
     expect(summary.warnings.some((w) => w.message.includes("could not verify"))).toBe(true);
   });
+
+  it("with --verified, runs checkApprove and surfaces reviewer_separation (the importer is necessarily the note's own author)", () => {
+    const ctx = makeTestContext({ actor: "human:reviewer" });
+    const dir = tmpDir();
+    writeMd(
+      dir,
+      "self-approved.md",
+      {
+        title: "自己承認ノート",
+        summary: "importしたactor自身がcreated_byになる新規ノートの要約文です。",
+        owner: "cs-team",
+        confidence: "medium",
+        source: [{ type: "manual", title: "seed" }],
+      },
+      "# 概要\n本文",
+    );
+
+    const summary = importPath(ctx, dir, { verified: true });
+    const created = getNoteRow(ctx.db, summary.createdIds[0]);
+    expect(created?.status).toBe("verified");
+    expect(
+      summary.warnings.some((w) => w.message.includes("policy warnings") && w.message.includes("reviewer_separation")),
+    ).toBe(true);
+  });
+
+  it("includes tags and sources in the note_updated history snapshot for a draft re-import (not just the note row)", () => {
+    const ctx = makeTestContext({ actor: "agent:codex" });
+    const notes = createNoteService(ctx);
+    const created = notes.createDraft({
+      title: "元タイトル2",
+      summary: "元の要約文です。二十文字以上の長さがあります。",
+      body: "# 概要\n元の本文",
+      tags: ["support"],
+      source: [{ type: "url", url: "https://example.com/b" }],
+      confidence: "medium",
+    });
+
+    const dir = tmpDir();
+    writeMd(
+      dir,
+      "resnap.md",
+      { id: created.note.id, title: "新タイトル2", tags: ["support", "faq"], source: [{ type: "manual" }] },
+      "# 概要\n更新後の本文",
+    );
+    importPath(ctx, dir);
+
+    const events = ctx.db
+      .prepare(
+        "SELECT before_snapshot_json, after_snapshot_json FROM history_events WHERE entity_id = ? AND event_type = 'note_updated'",
+      )
+      .get(created.note.id) as { before_snapshot_json: string; after_snapshot_json: string };
+    const before = JSON.parse(events.before_snapshot_json);
+    const after = JSON.parse(events.after_snapshot_json);
+    expect(before.tags).toEqual(["support"]);
+    expect(before.sources).toHaveLength(1);
+    expect(before.sources[0].url).toBe("https://example.com/b");
+    expect(after.tags.sort()).toEqual(["faq", "support"]);
+    expect(after.sources).toHaveLength(1);
+    expect(after.sources[0].type).toBe("manual");
+  });
 });

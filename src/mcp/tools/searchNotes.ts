@@ -5,6 +5,7 @@ import { parseOrThrow } from "../../core/errors.js";
 import { createLikeSearchEngine } from "../../core/search.js";
 import { NoteStatus, Confidence } from "../../types/common.js";
 import { CitationSchema } from "../schemas.js";
+import { ARCHIVED_USAGE_WARNING } from "./getNote.js";
 import { okResult, errorResult, type ToolResult } from "../toolResponse.js";
 
 export const SearchNotesInput = z.object({
@@ -31,6 +32,7 @@ const SearchResultItemOutput = z.object({
   matched_fields: z.array(z.string()),
   snippet: z.string(),
   citation: CitationSchema,
+  usage_warning: z.string().optional(),
 });
 
 export const SearchNotesOutput = z.object({
@@ -83,6 +85,7 @@ export function searchNotesTool(ctx: AppContext, rawInput: unknown): ToolResult 
         matched_fields: r.matchedFields,
         snippet: r.snippet,
         citation: r.citation,
+        usage_warning: r.status === "archived" ? ARCHIVED_USAGE_WARNING : undefined,
       })),
     });
   } catch (err) {
@@ -92,7 +95,8 @@ export function searchNotesTool(ctx: AppContext, rawInput: unknown): ToolResult 
 
 const DESCRIPTION = `[verified plane] 知識ノートを検索する。対象は常にverified(必要ならinclude_archived:trueでarchivedも含む)。draft/rejectedは対象外で、承認待ちの確認にはlist_review_items/get_review_itemを使うこと。
 結果が0件の場合はno_results:trueとguidanceを返す。このとき一般知識や学習済みの知識を組織の正式ポリシーであるかのように提示しないこと。確度の高い知識を提供できるなら、create_note_draftで新規知識案として提案すること。
-各結果のcitationにはnote_id/version/updated_at/review_due_at/staleを含む。回答の根拠として引用する際は必ずこのcitationを使うこと。stale: trueのnoteは正式根拠として使ってよいが、要再確認である旨を回答に明示すること。strict_stale_filter設定が有効な場合、stale noteは結果から除外される。`;
+各結果のcitationにはnote_id/version/updated_at/review_due_at/staleを含む。回答の根拠として引用する際は必ずこのcitationを使うこと。stale: trueのnoteは正式根拠として使ってよいが、要再確認である旨を回答に明示すること。strict_stale_filter設定が有効な場合、stale noteは結果から除外される。
+statusがarchivedの結果にはusage_warningが付く。archivedは現行根拠として非推奨であり、詳細を確認したい場合はget_noteで(同じ)警告つきの全文を取得すること。`;
 
 export function registerSearchNotesTool(server: McpServer, ctx: AppContext): void {
   server.registerTool(

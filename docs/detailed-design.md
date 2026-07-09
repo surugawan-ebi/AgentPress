@@ -166,11 +166,12 @@ CREATE TABLE import_batches (
 CREATE TABLE idempotency_keys (
   key TEXT NOT NULL,
   tool TEXT NOT NULL,
-  request_hash TEXT NOT NULL,                 -- 入力JSONのSHA-256。同一keyで入力が違えば invalid_input
+  actor TEXT NOT NULL,                        -- 同一keyでも actor が違えば別予約として扱う（MCPサーバはactorごとに別プロセス）
+  request_hash TEXT NOT NULL,                 -- 入力JSONのSHA-256。同一key+actorで入力が違えば invalid_input
   status TEXT NOT NULL DEFAULT 'in_progress' CHECK (status IN ('in_progress','completed')),
   result_json TEXT,
   created_at TEXT NOT NULL,
-  PRIMARY KEY (key, tool)
+  PRIMARY KEY (key, tool, actor)
 );
 
 CREATE TABLE schema_migrations (
@@ -237,8 +238,13 @@ createProposal(input: ProposeUpdateInput): { proposal: Proposal; policyWarnings:
 //   （AIが古いget_note結果を基に提案するのを作成時点で検出する。approve時のlockは別途維持）
 approve(targetId, reason?): ApproveResult      // note_→draft承認 / proposal_→反映。version検証→needs_rebaseカスケード
 reject(targetId, reason): RejectResult         // note_→rejected / proposal_→rejected
-listReviewItems(filter): ReviewItem[]          // kind/scope/created_by("self")/status/limit/cursor/sort
-getReviewItem(id): ReviewItemDetail            // usable_as_context:false, needs_rebase時は復旧情報
+listReviewItems(filter): { items: ReviewItem[]; nextCursor: string | null }
+//   kind/scope/created_by("self")/status/limit(省略時20)/cursor/sort。
+//   status はレビュー系語彙に正規化: draft noteは"pending_review"として返し、元のnotes.statusは
+//   kind:"draft"の項目のみnoteStatusで保持。filterのstatus:"pending_review"はdraft note+
+//   pending_reviewなproposalの両方に、"rejected"は両方のrejectedにマッチ、"needs_rebase"はproposal限定。
+//   結果がちょうどlimit件のときnextCursorに最後のidを返す（簡易cursor、正確な残件判定はしない）
+getReviewItem(id): ReviewItemDetail            // usable_as_context:false, needs_rebase時は復旧情報。statusはlistReviewItemsと同じ正規化+noteStatus
 
 // search.ts
 interface SearchEngine { search(input: SearchInput): SearchResult }
@@ -271,13 +277,13 @@ buildUnifiedDiff(before, after, label): string
 changedFields(input, note): string[]
 ```
 
-`approve` の処理順: 対象判定 → policy 検証（警告収集）→ reviewer separation 警告 → proposal なら `base_note_version === note.version` を検証。**不一致の場合は「当該 proposal を `needs_rebase` に更新 + history 記録」だけを独立トランザクションで commit してから `version_conflict` エラーを返す**（better-sqlite3 の transaction は throw で rollback されるため、状態更新とエラー送出を同一 tx に入れない）。一致する場合は 1 トランザクションで: note へ反映 + `version+1` + `verified_at`/`review_due_at` 設定 → proposal を `approved` に → 同一 note の他 pending proposal を `needs_rebase` に + `proposal_needs_rebase` イベント → history 記録。
+`approve` の処理順: 対象判定 → policy 検証（警告収集）→ reviewer separation 警告 → proposal なら `base_note_version === note.version` の事前チェック（安価な早期リターン用で、複数プロセス間の TOCTOU に対しては脆弱なため正しさの保証には使わない）。**不一致の場合は「当該 proposal を `needs_rebase` に更新 + history 記録」だけを独立トランザクションで commit してから `version_conflict` エラーを返す**（better-sqlite3 の transaction は throw で rollback されるため、状態更新とエラー送出を同一 tx に入れない）。事前チェックが一致した場合は 1 トランザクションで: `UPDATE notes ... WHERE id=@id AND version=@base_note_version AND status='verified'` を実行して `changes === 1` を検証する（これが実際の楽観ロック本体。0 件なら別プロセスがその間に version を進めたということなので、専用の例外を投げてこのトランザクションをロールバックし、事前チェック不一致時と同じ「needs_rebase 更新 + history を独立トランザクションで commit → `version_conflict`」経路にフォールバックする。フォールバック時は `note.version` を再取得してエラーメッセージに使う）。`changes === 1` なら同一トランザクション内で: note へ反映（`version+1` / `verified_at` / `review_due_at` 更新）→ `proposal.source` の各エントリを `note_sources` へ追記マージ（`type`+`url`+`path` が完全一致する既存行はスキップして重複を防ぐ。置き換えではなく追加）→ proposal を `approved` に → 同一 note の他 pending proposal を `needs_rebase` に + `proposal_needs_rebase` イベント → history 記録。draft note の承認も同様に `version+1` する（内容は変わらないが、spec.md の承認手順どおり単調増加を保つ）。note 系 history event の `before_snapshot_json`/`after_snapshot_json` は `noteRows.ts` の `buildNoteSnapshot(db, noteRow)`（`{note, tags, sources}`）に統一し、`note` 行だけでなく tags/sources も必ず含める。
 
 ## MCP server 設計
 
 - `McpServer` に 8 tool を登録。tool ごとに zod の input schema **と outputSchema** を定義し、description には「draft/review item を正式根拠に使わない」「0件時の挙動」「stale の扱い」を明記する
 - レスポンスは `structuredContent`（構造化 JSON）を正とし、`content: [{type:"text", text: JSON.stringify(result)}]` を fallback として併記。エラーは `isError: true` + エラー JSON
-- mutating tool（create_note_draft / update_draft / propose_note_update）は `idempotency.ts` のラッパを通す。フロー: mutation 本体と同一トランザクション内で (1) `(key, tool)` を INSERT（既存行あり: `completed` なら保存済み結果を返す。`in_progress` なら retryable エラー。`request_hash` 不一致なら `invalid_input`）→ (2) mutation 実行 → (3) `result_json` を保存し `completed` に更新。トランザクションが atomicity を担保する
+- mutating tool（create_note_draft / update_draft / propose_note_update）は `idempotency.ts` のラッパを通す。予約は `(key, tool, actor)` 単位（同一keyでもactorが違えば別予約。MCPサーバはactorごとに別プロセスで起動するため）。フロー: (1) 短い独立トランザクションで予約行を INSERT して即 commit し、他プロセスからも `in_progress` が見えるようにする（既存行あり: `completed` なら保存済み結果を返す。`in_progress` かつ10分以内なら `in_progress` retryable エラー。10分より古い`in_progress`は放棄されたとみなし上書きして予約を取得する。`request_hash` 不一致なら `invalid_input`）→ (2) 予約 tx の外で mutation を実行（失敗時は `finally` で予約行を削除しリトライ可能にする）→ (3) 成功時に `result_json` を保存し `completed` に更新
 - `propose_note_update` の入力に `base_note_version`（必須）を追加。get_note の citation.version をそのまま渡す想定
 - search_notes の 0 件時は仕様どおり `no_results: true` / `guidance` / `suggested_next_tools` / `searched_statuses`
 - citation は `{label, note_id, version, updated_at, review_due_at, stale, confidence, status, scope}` を共通ヘルパで生成

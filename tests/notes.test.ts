@@ -119,6 +119,26 @@ describe("updateDraft", () => {
     expect(result.note.status).toBe("draft");
   });
 
+  it("includes tags and sources (not just the note row) in the note_updated history snapshot", () => {
+    const ctx = makeTestContext({ actor: "agent:codex" });
+    const notes = createNoteService(ctx);
+    const created = notes.createDraft(baseDraftInput());
+
+    notes.updateDraft({ id: created.note.id, title: "返金ポリシー（改訂版）" });
+
+    const row = ctx.db
+      .prepare("SELECT before_snapshot_json, after_snapshot_json FROM history_events WHERE entity_id = ? AND event_type = 'note_updated'")
+      .get(created.note.id) as { before_snapshot_json: string; after_snapshot_json: string };
+    const before = JSON.parse(row.before_snapshot_json);
+    const after = JSON.parse(row.after_snapshot_json);
+    expect(before.tags).toEqual(["support"]);
+    expect(before.sources).toHaveLength(1);
+    expect(before.sources[0].url).toBe("https://example.com/policy");
+    expect(after.tags).toEqual(["support"]);
+    expect(after.sources).toHaveLength(1);
+    expect(after.note.title).toBe("返金ポリシー（改訂版）");
+  });
+
   it("rejects edits from a different actor", () => {
     const ctx = makeTestContext({ actor: "agent:codex" });
     const notes = createNoteService(ctx);

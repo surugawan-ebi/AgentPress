@@ -10,6 +10,8 @@ import {
   getTags,
   getSources,
   replaceTags,
+  appendSources,
+  buildNoteSnapshot,
   rowToNote,
   type NoteRow,
 } from "./noteRows.js";
@@ -22,9 +24,32 @@ import {
   type ReviewItem,
   type ReviewItemFilter,
   type ReviewItemDetail,
+  type ListReviewItemsResult,
 } from "../types/proposal.js";
 import type { PolicyWarning } from "../types/policy.js";
-import type { Confidence } from "../types/common.js";
+import type { Confidence, SourceInput } from "../types/common.js";
+
+/** Default page size for listReviewItems when the caller doesn't specify one. */
+const DEFAULT_LIST_REVIEW_ITEMS_LIMIT = 20;
+
+/** review plane normalization: a draft note reads as "pending_review" so it's
+ *  filterable/comparable the same way as a proposal (see types/proposal.ts). */
+function normalizeNoteReviewStatus(rawStatus: string): string {
+  return rawStatus === "draft" ? "pending_review" : rawStatus;
+}
+
+/** Inverse of normalizeNoteReviewStatus, for translating an incoming status filter into
+ *  the raw notes.status value. undefined means "no note can have this normalized status"
+ *  (e.g. "needs_rebase" only ever applies to proposals). */
+const NOTE_RAW_STATUS_BY_NORMALIZED: Record<string, string | undefined> = {
+  pending_review: "draft",
+  rejected: "rejected",
+};
+
+/** Signals "the compound version+status WHERE clause matched 0 rows" from inside a
+ *  db.transaction() callback, so the transaction rolls back and the caller can fall
+ *  back to the needs_rebase path with an accurate (freshly re-read) current version. */
+class ApproveVersionMismatch extends Error {}
 
 interface ProposalRow {
   id: string;
@@ -83,7 +108,7 @@ export interface ReviewService {
   createProposal(input: ProposeUpdateInput): CreateProposalResult;
   approve(targetId: string, reason?: string): ApproveResult;
   reject(targetId: string, reason: string): RejectResult;
-  listReviewItems(filter: ReviewItemFilter): ReviewItem[];
+  listReviewItems(filter: ReviewItemFilter): ListReviewItemsResult;
   getReviewItem(id: string): ReviewItemDetail;
 }
 
@@ -280,11 +305,18 @@ export function createReviewService(ctx: AppContext): ReviewService {
       throw new AgentPressError("not_found", `${targetId} was not found`, { details: { id: targetId } });
     },
 
-    listReviewItems(filter: ReviewItemFilter): ReviewItem[] {
+    listReviewItems(filter: ReviewItemFilter): ListReviewItemsResult {
       const createdByFilter = filter.createdBy === "self" ? actor : filter.createdBy;
       const items: ReviewItem[] = [];
 
-      if (!filter.kind || filter.kind === "draft") {
+      // A normalized status filter (e.g. "needs_rebase") may have no corresponding raw
+      // notes.status at all; in that case the draft branch matches nothing and we skip
+      // querying it entirely rather than running a query with a status clause that (by
+      // coincidence) could match something it shouldn't.
+      const draftRawStatus = filter.status ? NOTE_RAW_STATUS_BY_NORMALIZED[filter.status] : undefined;
+      const draftBranchApplies = (!filter.kind || filter.kind === "draft") && (!filter.status || draftRawStatus);
+
+      if (draftBranchApplies) {
         const clauses = ["status IN ('draft', 'rejected')"];
         const params: Record<string, unknown> = {};
         if (filter.scope) {
@@ -295,9 +327,9 @@ export function createReviewService(ctx: AppContext): ReviewService {
           clauses.push("created_by = @createdBy");
           params.createdBy = createdByFilter;
         }
-        if (filter.status) {
+        if (draftRawStatus) {
           clauses.push("status = @status");
-          params.status = filter.status;
+          params.status = draftRawStatus;
         }
         const rows = db.prepare(`SELECT * FROM notes WHERE ${clauses.join(" AND ")}`).all(params) as NoteRow[];
         for (const row of rows) {
@@ -314,7 +346,8 @@ export function createReviewService(ctx: AppContext): ReviewService {
           items.push({
             id: row.id,
             kind: "draft",
-            status: row.status,
+            status: normalizeNoteReviewStatus(row.status),
+            noteStatus: row.status,
             scope: row.scope,
             createdBy: row.created_by,
             createdAt: row.created_at,
@@ -326,6 +359,8 @@ export function createReviewService(ctx: AppContext): ReviewService {
       }
 
       if (!filter.kind || filter.kind === "proposal") {
+        // Proposal status is already the review-plane vocabulary 1:1 (pending_review/
+        // needs_rebase/rejected/approved), so filter.status passes straight through.
         const clauses = ["p.status IN ('pending_review', 'needs_rebase', 'rejected')"];
         const params: Record<string, unknown> = {};
         if (filter.scope) {
@@ -370,8 +405,10 @@ export function createReviewService(ctx: AppContext): ReviewService {
         const idx = sorted.findIndex((i) => i.id === filter.cursor);
         if (idx >= 0) sorted = sorted.slice(idx + 1);
       }
-      if (filter.limit) sorted = sorted.slice(0, filter.limit);
-      return sorted;
+      const limit = filter.limit ?? DEFAULT_LIST_REVIEW_ITEMS_LIMIT;
+      const page = sorted.slice(0, limit);
+      const nextCursor = page.length === limit && page.length > 0 ? page[page.length - 1].id : null;
+      return { items: page, nextCursor };
     },
 
     getReviewItem(id: string): ReviewItemDetail {
@@ -389,7 +426,8 @@ export function createReviewService(ctx: AppContext): ReviewService {
         return {
           id: note.id,
           kind: "note",
-          status: note.status,
+          status: normalizeNoteReviewStatus(note.status),
+          noteStatus: note.status,
           usableAsContext: false,
           rejectionReason: note.rejection_reason,
           draftReason: note.draft_reason,
@@ -446,17 +484,19 @@ export function createReviewService(ctx: AppContext): ReviewService {
 
     const now = new Date().toISOString();
     const runApprove = db.transaction(() => {
+      const beforeSnapshot = buildNoteSnapshot(db, note);
       const reviewDueAt = policy.computeReviewDueAt(now);
       const updated: NoteRow = {
         ...note,
         status: "verified",
+        version: note.version + 1,
         verified_at: now,
         review_due_at: reviewDueAt,
         reviewed_by: actor,
         updated_at: now,
       };
       db.prepare(
-        `UPDATE notes SET status=@status, verified_at=@verified_at, review_due_at=@review_due_at,
+        `UPDATE notes SET status=@status, version=@version, verified_at=@verified_at, review_due_at=@review_due_at,
            reviewed_by=@reviewed_by, updated_at=@updated_at WHERE id=@id`,
       ).run(updated);
       history.record({
@@ -467,13 +507,45 @@ export function createReviewService(ctx: AppContext): ReviewService {
         role,
         scope: note.scope,
         reason: reason ?? null,
-        beforeSnapshot: { note },
-        afterSnapshot: { note: updated },
+        beforeSnapshot,
+        afterSnapshot: buildNoteSnapshot(db, updated),
       });
       return rowToNote(updated);
     });
 
     return { kind: "note", note: runApprove(), cascadedNeedsRebase: [], policyWarnings };
+  }
+
+  /**
+   * Commits the needs_rebase transition on its own transaction (it must survive), THEN
+   * throws version_conflict. A single transaction would roll this update back too when
+   * the error propagates, since better-sqlite3 transactions rollback on throw.
+   */
+  function markNeedsRebaseAndThrow(proposal: ProposalRow, note: NoteRow, reason: string | undefined): never {
+    const markNeedsRebase = db.transaction(() => {
+      db.prepare("UPDATE update_proposals SET status='needs_rebase' WHERE id=?").run(proposal.id);
+      history.record({
+        entityType: "proposal",
+        entityId: proposal.id,
+        eventType: "proposal_needs_rebase",
+        actor,
+        role,
+        scope: note.scope,
+        reason: reason ?? null,
+        beforeSnapshot: { proposal },
+        afterSnapshot: { proposal: { ...proposal, status: "needs_rebase" } },
+      });
+    });
+    markNeedsRebase();
+    throw new AgentPressError(
+      "version_conflict",
+      `proposal ${proposal.id} is based on version ${proposal.base_note_version} but the note is now at version ${note.version}`,
+      {
+        details: { base_note_version: proposal.base_note_version, current_version: note.version },
+        retryable: true,
+        suggested_action: "fetch the current note and resubmit propose_note_update",
+      },
+    );
   }
 
   function approveProposal(id: string, reason?: string): ApproveResult {
@@ -492,49 +564,32 @@ export function createReviewService(ctx: AppContext): ReviewService {
       });
     }
 
-    // Version mismatch: commit the needs_rebase transition on its own transaction
-    // (it must survive), THEN throw. A single transaction would roll the update back
-    // when the error propagates, since better-sqlite3 transactions rollback on throw.
+    // Cheap pre-check for the common case: skip building effective/policyWarnings and
+    // opening a transaction when it's already obviously stale. This alone is NOT the
+    // correctness guard (TOCTOU: another process -- e.g. the MCP server and a CLI
+    // invocation sharing the same db file -- could bump the version between this read
+    // and the transaction below), so it must produce the same result as the guarded
+    // path if hit; the real guard is the compound WHERE clause inside runApprove.
     if (proposal.base_note_version !== note.version) {
-      const markNeedsRebase = db.transaction(() => {
-        db.prepare("UPDATE update_proposals SET status='needs_rebase' WHERE id=?").run(proposal.id);
-        history.record({
-          entityType: "proposal",
-          entityId: proposal.id,
-          eventType: "proposal_needs_rebase",
-          actor,
-          role,
-          scope: note.scope,
-          reason: reason ?? null,
-          beforeSnapshot: { proposal },
-          afterSnapshot: { proposal: { ...proposal, status: "needs_rebase" } },
-        });
-      });
-      markNeedsRebase();
-      throw new AgentPressError(
-        "version_conflict",
-        `proposal ${id} is based on version ${proposal.base_note_version} but the note is now at version ${note.version}`,
-        {
-          details: { base_note_version: proposal.base_note_version, current_version: note.version },
-          retryable: true,
-          suggested_action: "fetch the current note and resubmit propose_note_update",
-        },
-      );
+      markNeedsRebaseAndThrow(proposal, note, reason);
     }
 
     const currentTags = getTags(db, note.id);
     const effective = effectiveProposalFields(note, currentTags, proposal);
+    const proposalSources = JSON.parse(proposal.source_json) as SourceInput[];
     const policyWarnings = policy.checkApprove({
       kind: "proposal",
       authorActor: proposal.proposed_by,
       confidence: effective.confidence as Confidence,
       owner: note.owner,
-      sources: JSON.parse(proposal.source_json),
+      sources: proposalSources,
       noteReviewDueAt: note.review_due_at,
     });
 
     const now = new Date().toISOString();
     const runApprove = db.transaction(() => {
+      const beforeSnapshot = buildNoteSnapshot(db, note);
+      const reviewDueAt = policy.computeReviewDueAt(now);
       const updatedNote: NoteRow = {
         ...note,
         title: effective.title,
@@ -544,15 +599,30 @@ export function createReviewService(ctx: AppContext): ReviewService {
         confidence: effective.confidence,
         version: note.version + 1,
         updated_at: now,
+        verified_at: now,
+        review_due_at: reviewDueAt,
         reviewed_by: actor,
         search_text: buildSearchText(effective.title, effective.summary, effective.body, effective.tags),
       };
-      db.prepare(
-        `UPDATE notes SET title=@title, summary=@summary, body=@body, scope=@scope, confidence=@confidence,
-           version=@version, updated_at=@updated_at, reviewed_by=@reviewed_by, search_text=@search_text
-         WHERE id=@id`,
-      ).run(updatedNote);
+
+      // The optimistic lock lives here, not in the pre-check above: only commit if the
+      // row still has the version/status this proposal was created against. 0 rows
+      // changed means someone else (possibly another process) got there first.
+      const updateResult = db
+        .prepare(
+          `UPDATE notes SET title=@title, summary=@summary, body=@body, scope=@scope, confidence=@confidence,
+             version=@version, updated_at=@updated_at, verified_at=@verified_at, review_due_at=@review_due_at,
+             reviewed_by=@reviewed_by, search_text=@search_text
+           WHERE id=@id AND version=@expectedVersion AND status='verified'`,
+        )
+        .run({ ...updatedNote, expectedVersion: proposal.base_note_version });
+
+      if (updateResult.changes !== 1) {
+        throw new ApproveVersionMismatch();
+      }
+
       if (proposal.proposed_tags_json) replaceTags(db, note.id, effective.tags);
+      appendSources(db, note.id, proposalSources);
 
       const updatedProposal: ProposalRow = { ...proposal, status: "approved", reviewed_by: actor, reviewed_at: now };
       db.prepare("UPDATE update_proposals SET status='approved', reviewed_by=@reviewed_by, reviewed_at=@reviewed_at WHERE id=@id").run(
@@ -578,8 +648,8 @@ export function createReviewService(ctx: AppContext): ReviewService {
         role,
         scope: note.scope,
         reason: reason ?? null,
-        beforeSnapshot: { note, tags: currentTags },
-        afterSnapshot: { note: updatedNote, tags: effective.tags },
+        beforeSnapshot,
+        afterSnapshot: buildNoteSnapshot(db, updatedNote),
       });
 
       const others = db
@@ -605,7 +675,20 @@ export function createReviewService(ctx: AppContext): ReviewService {
       return { note: rowToNote(updatedNote), proposal: rowToProposal(updatedProposal), cascaded };
     });
 
-    const result = runApprove();
+    let result: { note: import("../types/note.js").Note; proposal: Proposal; cascaded: string[] };
+    try {
+      result = runApprove();
+    } catch (err) {
+      if (err instanceof ApproveVersionMismatch) {
+        // Another writer beat us between the pre-check and the transaction's commit;
+        // re-read to report an accurate current_version, then follow the exact same
+        // needs_rebase + version_conflict path as the pre-check above.
+        const freshNote = requireNoteRow(proposal.note_id);
+        markNeedsRebaseAndThrow(proposal, freshNote, reason);
+      }
+      throw err;
+    }
+
     return {
       kind: "proposal",
       note: result.note,
@@ -624,6 +707,7 @@ export function createReviewService(ctx: AppContext): ReviewService {
     }
     const now = new Date().toISOString();
     const runReject = db.transaction(() => {
+      const beforeSnapshot = buildNoteSnapshot(db, note);
       const updated: NoteRow = { ...note, status: "rejected", rejection_reason: reason, updated_at: now };
       db.prepare("UPDATE notes SET status=@status, rejection_reason=@rejection_reason, updated_at=@updated_at WHERE id=@id").run(
         updated,
@@ -636,8 +720,8 @@ export function createReviewService(ctx: AppContext): ReviewService {
         role,
         scope: note.scope,
         reason,
-        beforeSnapshot: { note },
-        afterSnapshot: { note: updated },
+        beforeSnapshot,
+        afterSnapshot: buildNoteSnapshot(db, updated),
       });
       return rowToNote(updated);
     });

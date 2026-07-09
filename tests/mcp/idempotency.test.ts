@@ -1,7 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { createNoteDraftTool, CreateNoteDraftInput } from "../../src/mcp/tools/createNoteDraft.js";
 import { updateDraftTool } from "../../src/mcp/tools/updateDraft.js";
-import { hashRequest } from "../../src/mcp/idempotency.js";
+import { withIdempotency, hashRequest } from "../../src/mcp/idempotency.js";
+import { AgentPressError } from "../../src/core/errors.js";
 import { makeTestContext, insertNoteFixture } from "../helpers.js";
 import { structured, errorPayload } from "./toolTestHelpers.js";
 
@@ -52,12 +53,13 @@ describe("idempotency (mutating MCP tools)", () => {
     const { idempotency_key, ...coreInput } = CreateNoteDraftInput.parse(rawInput);
     ctx.db
       .prepare(
-        `INSERT INTO idempotency_keys (key, tool, request_hash, status, result_json, created_at)
-         VALUES (@key, @tool, @request_hash, 'in_progress', NULL, @created_at)`,
+        `INSERT INTO idempotency_keys (key, tool, actor, request_hash, status, result_json, created_at)
+         VALUES (@key, @tool, @actor, @request_hash, 'in_progress', NULL, @created_at)`,
       )
       .run({
         key: idempotency_key,
         tool: "create_note_draft",
+        actor: ctx.actor,
         request_hash: hashRequest(coreInput),
         created_at: new Date().toISOString(),
       });
@@ -82,5 +84,67 @@ describe("idempotency (mutating MCP tools)", () => {
 
     const row = ctx.db.prepare("SELECT version FROM notes WHERE id = ?").get("note_u1") as { version: number };
     expect(row.version).toBe(2);
+  });
+
+  it("scopes reservations by actor: the same key from two different actors never collides", () => {
+    const ctxA = makeTestContext({ actor: "agent:a" });
+    const ctxB = { ...ctxA, actor: "agent:b" };
+
+    const resultA = structured<{ id: string; final_slug: string }>(
+      createNoteDraftTool(ctxA, draftInput({ idempotency_key: "shared-key", title: "Aのノート" })),
+    );
+    // Same key, different actor, *different* input -- must not throw invalid_input, since
+    // reservations are keyed on (key, tool, actor), not just (key, tool).
+    const resultB = structured<{ id: string; final_slug: string }>(
+      createNoteDraftTool(ctxB, draftInput({ idempotency_key: "shared-key", title: "Bのノート" })),
+    );
+
+    expect(resultA.id).not.toBe(resultB.id);
+    const noteCount = ctxA.db.prepare("SELECT COUNT(*) AS c FROM notes").get() as { c: number };
+    expect(noteCount.c).toBe(2);
+    const reservationCount = ctxA.db.prepare("SELECT COUNT(*) AS c FROM idempotency_keys WHERE key = 'shared-key'").get() as {
+      c: number;
+    };
+    expect(reservationCount.c).toBe(2);
+  });
+
+  it("deletes the reservation when mutate() throws, so the same key is retryable afterwards", () => {
+    const ctx = makeTestContext({ actor: "agent:codex" });
+
+    expect(() =>
+      withIdempotency(ctx, "test_tool", "retry-key", { a: 1 }, () => {
+        throw new AgentPressError("invalid_input", "deliberate failure for the test");
+      }),
+    ).toThrow(AgentPressError);
+
+    const afterFailure = ctx.db.prepare("SELECT COUNT(*) AS c FROM idempotency_keys WHERE key = 'retry-key'").get() as {
+      c: number;
+    };
+    expect(afterFailure.c).toBe(0);
+
+    // Retrying with the same key now succeeds instead of being stuck as "in_progress" forever.
+    const result = withIdempotency(ctx, "test_tool", "retry-key", { a: 1 }, () => "ok");
+    expect(result).toBe("ok");
+  });
+
+  it("takes over an in_progress reservation older than 10 minutes instead of erroring", () => {
+    const ctx = makeTestContext({ actor: "agent:codex" });
+    const staleCreatedAt = new Date(Date.now() - 11 * 60 * 1000).toISOString();
+    ctx.db
+      .prepare(
+        `INSERT INTO idempotency_keys (key, tool, actor, request_hash, status, result_json, created_at)
+         VALUES ('stale-key', 'test_tool', @actor, 'some-old-hash', 'in_progress', NULL, @created_at)`,
+      )
+      .run({ actor: ctx.actor, created_at: staleCreatedAt });
+
+    const result = withIdempotency(ctx, "test_tool", "stale-key", { a: 1 }, () => "recovered");
+    expect(result).toBe("recovered");
+
+    const row = ctx.db.prepare("SELECT status, result_json FROM idempotency_keys WHERE key = 'stale-key'").get() as {
+      status: string;
+      result_json: string;
+    };
+    expect(row.status).toBe("completed");
+    expect(JSON.parse(row.result_json)).toBe("recovered");
   });
 });

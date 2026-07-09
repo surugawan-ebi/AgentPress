@@ -98,4 +98,19 @@ describe("search_notes tool", () => {
     expect(withArchived.results.map((r) => r.id)).toContain("note_a");
     expect(withArchived.results[0].status).toBe("archived");
   });
+
+  it("attaches usage_warning to archived results but not to verified ones", () => {
+    const ctx = makeTestContext();
+    insertNote(ctx, { id: "note_verified1", title: "現行ガイド", summary: "現行の手順です。" });
+    insertNote(ctx, { id: "note_archived1", title: "現行ガイド旧版", summary: "旧版の手順です。", status: "archived" });
+
+    const body = structured<{ results: Array<{ id: string; status: string; usage_warning?: string }> }>(
+      searchNotesTool(ctx, { query: "現行ガイド", include_archived: true }),
+    );
+
+    const verified = body.results.find((r) => r.id === "note_verified1");
+    const archived = body.results.find((r) => r.id === "note_archived1");
+    expect(verified?.usage_warning).toBeUndefined();
+    expect(archived?.usage_warning).toBe("This note is archived and no longer recommended as current guidance.");
+  });
 });

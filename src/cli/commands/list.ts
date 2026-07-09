@@ -19,7 +19,7 @@ export function registerListCommand(program: Command): void {
         ctx = createContext({});
         if (opts.pending) {
           const reviews = createReviewService(ctx);
-          const items = reviews.listReviewItems({ scope: opts.scope, status: opts.status });
+          const { items } = reviews.listReviewItems({ scope: opts.scope, status: opts.status });
           console.log(renderPendingList(items));
         } else {
           const notes = createNoteService(ctx);

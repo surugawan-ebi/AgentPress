@@ -40,7 +40,10 @@ export interface RecordEventInput {
   role: string;
   scope?: string | null;
   reason?: string | null;
-  beforeSnapshot?: Record<string, unknown> | null;
-  afterSnapshot?: Record<string, unknown> | null;
+  // `object` (not Record<string, unknown>) so named snapshot types without an index
+  // signature (e.g. noteRows.ts's NoteSnapshot) can be passed directly, not just fresh
+  // object literals. Both are JSON.stringify'd as-is in history.ts's record().
+  beforeSnapshot?: object | null;
+  afterSnapshot?: object | null;
   metadata?: Record<string, unknown>;
 }

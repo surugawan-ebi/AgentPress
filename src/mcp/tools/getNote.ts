@@ -31,7 +31,9 @@ export const GetNoteOutput = z.object({
   usage_warning: z.string().optional(),
 });
 
-const ARCHIVED_USAGE_WARNING = "This note is archived and no longer recommended as current guidance.";
+// Shared with searchNotes.ts, which attaches the same warning to archived results
+// returned via include_archived:true.
+export const ARCHIVED_USAGE_WARNING = "This note is archived and no longer recommended as current guidance.";
 
 export function getNoteTool(ctx: AppContext, rawInput: unknown): ToolResult {
   try {

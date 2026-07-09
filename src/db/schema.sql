@@ -104,11 +104,12 @@ CREATE TABLE import_batches (
 CREATE TABLE idempotency_keys (
   key TEXT NOT NULL,
   tool TEXT NOT NULL,
+  actor TEXT NOT NULL,
   request_hash TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'in_progress' CHECK (status IN ('in_progress','completed')),
   result_json TEXT,
   created_at TEXT NOT NULL,
-  PRIMARY KEY (key, tool)
+  PRIMARY KEY (key, tool, actor)
 );
 
 CREATE TABLE schema_migrations (

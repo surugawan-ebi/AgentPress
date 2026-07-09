@@ -2,9 +2,14 @@ import { createHash } from "node:crypto";
 import type { AppContext } from "../core/context.js";
 import { AgentPressError } from "../core/errors.js";
 
+/** An in_progress reservation older than this is treated as abandoned (e.g. the process
+ *  that made it was killed mid-write) and can be taken over by a new attempt. */
+const STALE_IN_PROGRESS_MS = 10 * 60 * 1000;
+
 interface IdempotencyRow {
   key: string;
   tool: string;
+  actor: string;
   request_hash: string;
   status: "in_progress" | "completed";
   result_json: string | null;
@@ -31,12 +36,16 @@ export function hashRequest(input: unknown): string {
  * result instead of re-running the mutation. See detailed-design.md "MCP server 設計" and spec.md
  * "共通仕様".
  *
- * When `idempotencyKey` is absent, `mutate` just runs directly (no idempotency bookkeeping).
- * Otherwise the bookkeeping row and `mutate()` run inside one better-sqlite3 transaction (a
- * transaction started while already inside one becomes a SAVEPOINT), so if `mutate` throws, the
- * whole thing --including the "in_progress" row-- rolls back atomically. That also means an
- * "in_progress" row can only ever be observed if the process was killed mid-write; it's handled
- * here defensively rather than because normal synchronous execution can produce it.
+ * Reservations are scoped to (key, tool, actor): the same key from two different actors (e.g. two
+ * MCP server processes started for different agents) never collides.
+ *
+ * Unlike wrapping the whole thing in one transaction, the reservation is committed in its own
+ * short transaction *before* `mutate()` runs, so another process reading the db mid-mutation can
+ * see the `in_progress` row (this is what makes the in_progress error actually observable across
+ * processes, not just within a single connection). If `mutate()` throws, the reservation row is
+ * deleted in a `finally` so the same key is retryable afterwards instead of being stuck forever.
+ * An `in_progress` row older than STALE_IN_PROGRESS_MS is assumed abandoned (the writer died
+ * mid-mutation) and is taken over by the new attempt rather than blocking it.
  */
 export function withIdempotency<T>(
   ctx: AppContext,
@@ -47,52 +56,78 @@ export function withIdempotency<T>(
 ): T {
   if (!idempotencyKey) return mutate();
 
-  const { db } = ctx;
+  const { db, actor } = ctx;
   const hash = hashRequest(input);
 
-  const run = db.transaction((): T => {
+  const reserve = db.transaction((): "completed" | "reserved" => {
     const existing = db
-      .prepare("SELECT * FROM idempotency_keys WHERE key = ? AND tool = ?")
-      .get(idempotencyKey, tool) as IdempotencyRow | undefined;
+      .prepare("SELECT * FROM idempotency_keys WHERE key = ? AND tool = ? AND actor = ?")
+      .get(idempotencyKey, tool, actor) as IdempotencyRow | undefined;
 
     if (existing) {
-      if (existing.request_hash !== hash) {
+      const ageMs = Date.now() - new Date(existing.created_at).getTime();
+      const isAbandoned = existing.status === "in_progress" && ageMs > STALE_IN_PROGRESS_MS;
+
+      if (!isAbandoned) {
+        if (existing.request_hash !== hash) {
+          throw new AgentPressError(
+            "invalid_input",
+            `idempotency_key ${idempotencyKey} was already used with different input for ${tool}`,
+            {
+              details: { idempotency_key: idempotencyKey, tool },
+              suggested_action: "use a new idempotency_key for different input, or resend the exact original request",
+            },
+          );
+        }
+        if (existing.status === "completed") {
+          return "completed";
+        }
         throw new AgentPressError(
-          "invalid_input",
-          `idempotency_key ${idempotencyKey} was already used with different input for ${tool}`,
+          "in_progress",
+          `a request with idempotency_key ${idempotencyKey} is already in progress for ${tool}`,
           {
             details: { idempotency_key: idempotencyKey, tool },
-            suggested_action: "use a new idempotency_key for different input, or resend the exact original request",
+            retryable: true,
+            suggested_action: "wait and retry, or check list_review_items/get_note for the likely result",
           },
         );
       }
-      if (existing.status === "completed") {
-        return JSON.parse(existing.result_json as string) as T;
-      }
-      throw new AgentPressError(
-        "in_progress",
-        `a request with idempotency_key ${idempotencyKey} is already in progress for ${tool}`,
-        {
-          details: { idempotency_key: idempotencyKey, tool },
-          retryable: true,
-          suggested_action: "wait and retry, or check list_review_items/get_note for the likely result",
-        },
-      );
+
+      // Abandoned reservation: take it over for this new attempt, regardless of its old hash.
+      db.prepare(
+        `UPDATE idempotency_keys SET request_hash = @request_hash, status = 'in_progress',
+           result_json = NULL, created_at = @created_at
+         WHERE key = @key AND tool = @tool AND actor = @actor`,
+      ).run({ request_hash: hash, created_at: new Date().toISOString(), key: idempotencyKey, tool, actor });
+      return "reserved";
     }
 
     db.prepare(
-      `INSERT INTO idempotency_keys (key, tool, request_hash, status, result_json, created_at)
-       VALUES (@key, @tool, @request_hash, 'in_progress', NULL, @created_at)`,
-    ).run({ key: idempotencyKey, tool, request_hash: hash, created_at: new Date().toISOString() });
-
-    const result = mutate();
-
-    db.prepare(
-      "UPDATE idempotency_keys SET status = 'completed', result_json = @result_json WHERE key = @key AND tool = @tool",
-    ).run({ result_json: JSON.stringify(result), key: idempotencyKey, tool });
-
-    return result;
+      `INSERT INTO idempotency_keys (key, tool, actor, request_hash, status, result_json, created_at)
+       VALUES (@key, @tool, @actor, @request_hash, 'in_progress', NULL, @created_at)`,
+    ).run({ key: idempotencyKey, tool, actor, request_hash: hash, created_at: new Date().toISOString() });
+    return "reserved";
   });
 
-  return run();
+  const outcome = reserve();
+  if (outcome === "completed") {
+    const row = db
+      .prepare("SELECT result_json FROM idempotency_keys WHERE key = ? AND tool = ? AND actor = ?")
+      .get(idempotencyKey, tool, actor) as { result_json: string };
+    return JSON.parse(row.result_json) as T;
+  }
+
+  let result: T;
+  try {
+    result = mutate();
+  } catch (err) {
+    db.prepare("DELETE FROM idempotency_keys WHERE key = ? AND tool = ? AND actor = ?").run(idempotencyKey, tool, actor);
+    throw err;
+  }
+
+  db.prepare(
+    "UPDATE idempotency_keys SET status = 'completed', result_json = @result_json WHERE key = @key AND tool = @tool AND actor = @actor",
+  ).run({ result_json: JSON.stringify(result), key: idempotencyKey, tool, actor });
+
+  return result;
 }

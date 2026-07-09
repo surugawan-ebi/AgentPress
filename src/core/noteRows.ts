@@ -166,6 +166,61 @@ export function replaceSources(db: AgentPressDb, noteId: string, sources: Source
   }
 }
 
+/**
+ * Appends sources without touching existing rows (unlike replaceSources, which wipes
+ * first). Used when approving an update_proposal: the proposal's source[] is evidence
+ * for *this* change, additive to whatever the note already cites. A candidate is
+ * skipped if an existing row already has the same (type, url, path) -- the parts that
+ * identify "the same citation" -- to avoid piling up duplicates across re-approvals.
+ */
+export function appendSources(db: AgentPressDb, noteId: string, sources: SourceInput[]): void {
+  if (sources.length === 0) return;
+  const dedupeKey = (s: { type: string; url?: string | null; path?: string | null }) =>
+    `${s.type}|${s.url ?? ""}|${s.path ?? ""}`;
+  const seen = new Set(getSources(db, noteId).map(dedupeKey));
+  const insert = db.prepare(
+    `INSERT INTO note_sources (id, note_id, type, title, url, path, commit_sha, retrieved_at, metadata_json)
+     VALUES (@id, @note_id, @type, @title, @url, @path, @commit_sha, @retrieved_at, @metadata_json)`,
+  );
+  for (const source of sources) {
+    const key = dedupeKey(source);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    insert.run({
+      id: newId("src"),
+      note_id: noteId,
+      type: source.type,
+      title: source.title ?? null,
+      url: source.url ?? null,
+      path: source.path ?? null,
+      commit_sha: source.commit_sha ?? null,
+      retrieved_at: source.retrieved_at ?? null,
+      metadata_json: "{}",
+    });
+  }
+}
+
+export interface NoteSnapshot {
+  note: Note;
+  tags: string[];
+  sources: Source[];
+}
+
+/**
+ * Consistent {note, tags, sources} shape for history event before/after snapshots.
+ * Call this at the moment you want to capture state: before any mutation for a
+ * "before" snapshot, and after all mutations (including replaceTags/replaceSources/
+ * appendSources) for an "after" snapshot -- tags/sources live in separate tables and
+ * are fetched fresh from the DB here, not carried on noteRow itself.
+ */
+export function buildNoteSnapshot(db: AgentPressDb, noteRow: NoteRow): NoteSnapshot {
+  return {
+    note: rowToNote(noteRow),
+    tags: getTags(db, noteRow.id),
+    sources: getSources(db, noteRow.id),
+  };
+}
+
 export function slugify(title: string): string {
   const base = title
     .normalize("NFKC")

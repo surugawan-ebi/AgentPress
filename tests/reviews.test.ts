@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { createReviewService } from "../src/core/reviews.js";
 import { AgentPressError } from "../src/core/errors.js";
 import { makeTestContext, insertNoteFixture } from "./helpers.js";
@@ -69,7 +69,7 @@ describe("createProposal", () => {
     const err = captureError(() => reviews.createProposal(proposalInput({ id: "note_v2", base_note_version: 1 })));
     expect(err.code).toBe("version_conflict");
 
-    const items = reviews.listReviewItems({ kind: "proposal" });
+    const { items } = reviews.listReviewItems({ kind: "proposal" });
     expect(items).toHaveLength(0);
   });
 
@@ -103,6 +103,29 @@ describe("approve - draft note", () => {
     expect(result.note.status).toBe("verified");
     expect(result.note.verifiedAt).not.toBeNull();
     expect(result.note.reviewDueAt).not.toBeNull();
+    // spec.md's approve procedure bumps version on every applied change, draft approval included.
+    expect(result.note.version).toBe(2);
+  });
+
+  it("includes tags and sources (not just the note row) in the note_verified history snapshot", () => {
+    const ctx = makeTestContext({ actor: "reviewer:human" });
+    insertNoteFixture(ctx, { id: "note_d2b", status: "draft", createdBy: "agent:codex", owner: "support-team", tags: ["support"] });
+    ctx.db
+      .prepare(
+        "INSERT INTO note_sources (id, note_id, type, title, url, path, commit_sha, retrieved_at, metadata_json) VALUES ('src_d2b', 'note_d2b', 'url', 'doc', 'https://example.com', NULL, NULL, NULL, '{}')",
+      )
+      .run();
+    const reviews = createReviewService(ctx);
+
+    reviews.approve("note_d2b", "looks good");
+
+    const events = ctx.db.prepare("SELECT after_snapshot_json FROM history_events WHERE entity_id = 'note_d2b' AND event_type = 'note_verified'").get() as {
+      after_snapshot_json: string;
+    };
+    const snapshot = JSON.parse(events.after_snapshot_json);
+    expect(snapshot.tags).toEqual(["support"]);
+    expect(snapshot.sources).toHaveLength(1);
+    expect(snapshot.sources[0].url).toBe("https://example.com");
   });
 
   it("includes a reviewer_separation warning (but still approves) when approver === author", () => {
@@ -142,6 +165,70 @@ describe("approve - proposal", () => {
     expect(result.cascadedNeedsRebase).toEqual([]);
   });
 
+  it("refreshes verified_at and review_due_at on proposal approval, clearing staleness", () => {
+    const ctx = makeTestContext({ actor: "agent:codex" });
+    const past = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    insertNoteFixture(ctx, { id: "note_stale1", status: "verified", version: 1, reviewDueAt: past });
+    // Backdate verified_at itself (insertNoteFixture always stamps "now") so the "did this
+    // actually get refreshed" assertion below isn't relying on two Date.now() calls landing
+    // in different milliseconds.
+    ctx.db.prepare("UPDATE notes SET verified_at = ? WHERE id = ?").run(past, "note_stale1");
+    const reviews = createReviewService(ctx);
+    const { proposal } = reviews.createProposal(proposalInput({ id: "note_stale1" }));
+
+    const result = reviews.approve(proposal.id, "approved");
+
+    expect(result.note.reviewDueAt).not.toBeNull();
+    expect(result.note.reviewDueAt! > new Date().toISOString()).toBe(true);
+    expect(result.note.verifiedAt).not.toBeNull();
+    expect(result.note.verifiedAt!).not.toBe(past);
+    expect(result.note.verifiedAt! > past).toBe(true);
+  });
+
+  it("appends the proposal's source[] into note_sources on approval (additive merge, not a replace)", () => {
+    const ctx = makeTestContext({ actor: "agent:codex" });
+    insertNoteFixture(ctx, { id: "note_src1", status: "verified", version: 1 });
+    ctx.db
+      .prepare(
+        "INSERT INTO note_sources (id, note_id, type, title, url, path, commit_sha, retrieved_at, metadata_json) VALUES ('src_existing', 'note_src1', 'manual', 'original doc', NULL, NULL, NULL, NULL, '{}')",
+      )
+      .run();
+    const reviews = createReviewService(ctx);
+    const { proposal } = reviews.createProposal(
+      proposalInput({ id: "note_src1", source: [{ type: "url", url: "https://example.com/new" }] }),
+    );
+
+    reviews.approve(proposal.id, "approved");
+
+    const sources = ctx.db.prepare("SELECT type, url FROM note_sources WHERE note_id = 'note_src1' ORDER BY type").all() as Array<{
+      type: string;
+      url: string | null;
+    }>;
+    expect(sources).toEqual([
+      { type: "manual", url: null },
+      { type: "url", url: "https://example.com/new" },
+    ]);
+  });
+
+  it("skips a proposal source that already exists on the note (same type+url+path), avoiding duplicates", () => {
+    const ctx = makeTestContext({ actor: "agent:codex" });
+    insertNoteFixture(ctx, { id: "note_src2", status: "verified", version: 1 });
+    ctx.db
+      .prepare(
+        "INSERT INTO note_sources (id, note_id, type, title, url, path, commit_sha, retrieved_at, metadata_json) VALUES ('src_dup', 'note_src2', 'url', 'existing', 'https://example.com/dup', NULL, NULL, NULL, '{}')",
+      )
+      .run();
+    const reviews = createReviewService(ctx);
+    const { proposal } = reviews.createProposal(
+      proposalInput({ id: "note_src2", source: [{ type: "url", url: "https://example.com/dup" }] }),
+    );
+
+    reviews.approve(proposal.id, "approved");
+
+    const count = ctx.db.prepare("SELECT COUNT(*) AS c FROM note_sources WHERE note_id = 'note_src2'").get() as { c: number };
+    expect(count.c).toBe(1);
+  });
+
   it("on version mismatch, commits the proposal to needs_rebase THEN throws version_conflict", () => {
     const ctx = makeTestContext({ actor: "agent:codex" });
     insertNoteFixture(ctx, { id: "note_v6", status: "verified", version: 1 });
@@ -158,6 +245,57 @@ describe("approve - proposal", () => {
     const item = reviews.getReviewItem(proposal.id);
     expect(item.status).toBe("needs_rebase");
     expect(item.suggestedAction).toBe("fetch current note and resubmit");
+    expect(item.baseNoteVersion).toBe(1);
+    expect(item.currentNoteVersion).toBe(2);
+  });
+
+  it("closes the TOCTOU window: a version change that lands between the pre-check and the transaction's commit still results in needs_rebase, never a stale apply", () => {
+    const ctx = makeTestContext({ actor: "agent:codex" });
+    insertNoteFixture(ctx, { id: "note_toctou", status: "verified", version: 1, body: "# 概要\n古い本文" });
+    const reviews = createReviewService(ctx);
+    const { proposal } = reviews.createProposal(proposalInput({ id: "note_toctou" }));
+
+    // Simulate a second process (e.g. the MCP server and a CLI invocation sharing the same
+    // db file) bumping the note's version *after* approve()'s cheap pre-check has already
+    // read it as matching, but *before* runApprove()'s transaction begins. db.transaction(fn)
+    // only builds a wrapper -- it doesn't run fn -- so intercepting the wrapper's invocation
+    // and committing the "concurrent" write as its own independent statement first (i.e.
+    // *before* entering the transaction being tested, so it isn't rolled back along with it
+    // if that transaction fails) reproduces exactly the race window fix 1 closes. The
+    // correctness guard under test is the transaction's own WHERE clause, not this outer
+    // pre-check, so this must still resolve to needs_rebase/version_conflict.
+    const buildRealTransaction = ctx.db.transaction.bind(ctx.db);
+    let injected = false;
+    vi.spyOn(ctx.db, "transaction").mockImplementation(((fn: (...args: unknown[]) => unknown) => {
+      const invokeReal = buildRealTransaction(fn);
+      return (...args: unknown[]) => {
+        if (!injected) {
+          injected = true;
+          ctx.db.prepare("UPDATE notes SET version = 2 WHERE id = ?").run("note_toctou");
+        }
+        return invokeReal(...args);
+      };
+    }) as typeof ctx.db.transaction);
+
+    try {
+      const err = captureError(() => reviews.approve(proposal.id));
+      expect(err.code).toBe("version_conflict");
+      expect((err.details as { current_version: number }).current_version).toBe(2);
+    } finally {
+      vi.restoreAllMocks();
+    }
+
+    // The proposal's stale content must never have been applied -- only the "concurrent
+    // writer's" version bump is visible.
+    const noteRow = ctx.db.prepare("SELECT version, body FROM notes WHERE id = ?").get("note_toctou") as {
+      version: number;
+      body: string;
+    };
+    expect(noteRow.version).toBe(2);
+    expect(noteRow.body).not.toContain("更新後の本文");
+
+    const item = reviews.getReviewItem(proposal.id);
+    expect(item.status).toBe("needs_rebase");
     expect(item.baseNoteVersion).toBe(1);
     expect(item.currentNoteVersion).toBe(2);
   });
@@ -237,7 +375,7 @@ describe("listReviewItems", () => {
     const reviews = createReviewService(ctx);
     reviews.createProposal(proposalInput({ id: "note_l2" }));
 
-    const items = reviews.listReviewItems({});
+    const { items } = reviews.listReviewItems({});
     expect(items.map((i) => i.kind).sort()).toEqual(["draft", "proposal"]);
   });
 
@@ -248,17 +386,85 @@ describe("listReviewItems", () => {
     insertNoteFixture(ctx, { id: "note_l5", status: "draft", createdBy: "agent:codex", scope: "eng" });
     const reviews = createReviewService(ctx);
 
-    const mine = reviews.listReviewItems({ kind: "draft", scope: "support", createdBy: "self" });
+    const { items: mine } = reviews.listReviewItems({ kind: "draft", scope: "support", createdBy: "self" });
     expect(mine.map((i) => i.id)).toEqual(["note_l3"]);
   });
 
-  it("respects limit", () => {
+  it("respects an explicit limit", () => {
     const ctx = makeTestContext({ actor: "agent:codex" });
     insertNoteFixture(ctx, { id: "note_l6", status: "draft" });
     insertNoteFixture(ctx, { id: "note_l7", status: "draft" });
     const reviews = createReviewService(ctx);
 
-    expect(reviews.listReviewItems({ kind: "draft", limit: 1 })).toHaveLength(1);
+    const { items } = reviews.listReviewItems({ kind: "draft", limit: 1 });
+    expect(items).toHaveLength(1);
+  });
+
+  it("defaults to a limit of 20 when none is given", () => {
+    const ctx = makeTestContext({ actor: "agent:codex" });
+    for (let i = 0; i < 25; i++) {
+      insertNoteFixture(ctx, { id: `note_bulk${i}`, status: "draft" });
+    }
+    const reviews = createReviewService(ctx);
+
+    const { items, nextCursor } = reviews.listReviewItems({ kind: "draft" });
+    expect(items).toHaveLength(20);
+    expect(nextCursor).toBe(items[19].id);
+  });
+
+  it("returns nextCursor:null when the page is not full", () => {
+    const ctx = makeTestContext({ actor: "agent:codex" });
+    insertNoteFixture(ctx, { id: "note_l8", status: "draft" });
+    const reviews = createReviewService(ctx);
+
+    const { items, nextCursor } = reviews.listReviewItems({ kind: "draft" });
+    expect(items).toHaveLength(1);
+    expect(nextCursor).toBeNull();
+  });
+
+  it("normalizes a draft note's status to pending_review, keeping noteStatus as the raw value", () => {
+    const ctx = makeTestContext({ actor: "agent:codex" });
+    insertNoteFixture(ctx, { id: "note_l9", status: "draft" });
+    const reviews = createReviewService(ctx);
+
+    const { items } = reviews.listReviewItems({ kind: "draft" });
+    expect(items[0].status).toBe("pending_review");
+    expect(items[0].noteStatus).toBe("draft");
+  });
+
+  it("status:pending_review matches both a draft note and a pending_review proposal", () => {
+    const ctx = makeTestContext({ actor: "agent:codex" });
+    insertNoteFixture(ctx, { id: "note_l10", status: "draft", scope: "support" });
+    insertNoteFixture(ctx, { id: "note_l11", status: "verified", version: 1, scope: "support" });
+    const reviews = createReviewService(ctx);
+    reviews.createProposal(proposalInput({ id: "note_l11" }));
+
+    const { items } = reviews.listReviewItems({ status: "pending_review" });
+    expect(items.map((i) => i.kind).sort()).toEqual(["draft", "proposal"]);
+  });
+
+  it("status:rejected matches both a rejected note and a rejected proposal", () => {
+    const ctx = makeTestContext({ actor: "agent:codex" });
+    insertNoteFixture(ctx, { id: "note_l12", status: "rejected" });
+    insertNoteFixture(ctx, { id: "note_l13", status: "verified", version: 1 });
+    const reviews = createReviewService(ctx);
+    const { proposal } = reviews.createProposal(proposalInput({ id: "note_l13" }));
+    reviews.reject(proposal.id, "not needed");
+
+    const { items } = reviews.listReviewItems({ status: "rejected" });
+    expect(items.map((i) => i.kind).sort()).toEqual(["draft", "proposal"]);
+  });
+
+  it("status:needs_rebase matches only proposals, never notes", () => {
+    const ctx = makeTestContext({ actor: "agent:codex" });
+    insertNoteFixture(ctx, { id: "note_l14", status: "draft" });
+    insertNoteFixture(ctx, { id: "note_l15", status: "verified", version: 1 });
+    const reviews = createReviewService(ctx);
+    const { proposal } = reviews.createProposal(proposalInput({ id: "note_l15" }));
+    ctx.db.prepare("UPDATE update_proposals SET status='needs_rebase' WHERE id=?").run(proposal.id);
+
+    const { items } = reviews.listReviewItems({ status: "needs_rebase" });
+    expect(items.map((i) => i.id)).toEqual([proposal.id]);
   });
 });
 

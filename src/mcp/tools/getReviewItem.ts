@@ -16,6 +16,9 @@ export const GetReviewItemOutput = z.object({
   id: z.string(),
   kind: z.enum(["note", "proposal"]),
   status: z.string(),
+  // kind:"note" only: the note's actual notes.status (status above is normalized, e.g.
+  // "pending_review" for a draft note). See core/reviews.ts's normalizeNoteReviewStatus.
+  note_status: z.string().optional(),
   usable_as_context: z.literal(false),
   rejection_reason: z.string().nullable(),
   draft_reason: z.string().nullable().optional(),
@@ -45,6 +48,7 @@ export function getReviewItemTool(ctx: AppContext, rawInput: unknown): ToolResul
       id: item.id,
       kind: item.kind,
       status: item.status,
+      note_status: item.noteStatus,
       usable_as_context: false,
       rejection_reason: item.rejectionReason,
       draft_reason: item.draftReason,
@@ -66,6 +70,7 @@ export function getReviewItemTool(ctx: AppContext, rawInput: unknown): ToolResul
 }
 
 const DESCRIPTION = `[review plane] note_またはproposal_のIDから、全文とレビュー状態を返す。usable_as_contextは常にfalseで、正式根拠として使わないことを示す。
+statusはレビュー系語彙に正規化されている: kind:"note"でnoteが実際はdraftの場合、statusは"pending_review"になり、元のnotes.status(例:"draft")はnote_status(kind:"note"のときのみ)で確認できる。
 statusがneeds_rebaseのproposalには、base_note_version/current_note_version/target_note_id/suggested_actionが付き、AIが現行のverified noteを基準に(propose_note_updateで)再提案できるようにする。
 proposalの場合はreason/source/proposed_by/changed_fieldsも含み、何がなぜ提案されたか把握できる。
 このツールはレビュー状況の把握のみに使い、回答の根拠にはget_note/search_notesで取得したverified noteを使うこと。`;

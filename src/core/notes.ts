@@ -12,6 +12,7 @@ import {
   toDetail,
   replaceTags,
   replaceSources,
+  buildNoteSnapshot,
   slugify,
   resolveUniqueSlug,
   rowToNote,
@@ -122,7 +123,7 @@ export function createNoteService(ctx: AppContext): NoteService {
           role,
           scope: input.scope ?? null,
           reason: input.reason ?? null,
-          afterSnapshot: { note: row, tags: input.tags, sources: input.source },
+          afterSnapshot: buildNoteSnapshot(db, row),
         });
 
         return rowToNote(row);
@@ -185,6 +186,7 @@ export function createNoteService(ctx: AppContext): NoteService {
       });
 
       const runUpdate = db.transaction(() => {
+        const beforeSnapshot = buildNoteSnapshot(db, before);
         const updated: NoteRow = {
           ...before,
           title,
@@ -217,8 +219,8 @@ export function createNoteService(ctx: AppContext): NoteService {
           role,
           scope,
           reason: input.reason ?? null,
-          beforeSnapshot: { note: before, tags: beforeTags },
-          afterSnapshot: { note: updated, tags },
+          beforeSnapshot,
+          afterSnapshot: buildNoteSnapshot(db, updated),
         });
 
         return rowToNote(updated);
@@ -257,6 +259,7 @@ export function createNoteService(ctx: AppContext): NoteService {
 
       const now = new Date().toISOString();
       const runArchive = db.transaction(() => {
+        const beforeSnapshot = buildNoteSnapshot(db, before);
         const updated: NoteRow = { ...before, status: "archived", archived_at: now, updated_at: now };
         db.prepare("UPDATE notes SET status=@status, archived_at=@archived_at, updated_at=@updated_at WHERE id=@id").run(
           updated,
@@ -269,8 +272,8 @@ export function createNoteService(ctx: AppContext): NoteService {
           role,
           scope: before.scope,
           reason,
-          beforeSnapshot: { note: before },
-          afterSnapshot: { note: updated },
+          beforeSnapshot,
+          afterSnapshot: buildNoteSnapshot(db, updated),
         });
         return rowToNote(updated);
       });

@@ -62,10 +62,19 @@ export interface RejectResult {
   proposal?: Proposal;
 }
 
+/**
+ * `status` is normalized to the review-plane vocabulary (pending_review / needs_rebase /
+ * rejected) so it's filterable/comparable the same way regardless of kind: a draft note's
+ * raw notes.status='draft' is reported here as status:"pending_review". `noteStatus` (kind
+ * "draft" only) carries the original raw note status when you need to tell "this note is
+ * literally in draft" apart from "this note was rejected" -- both otherwise indistinguishable
+ * from a proposal's own pending_review/rejected without it.
+ */
 export interface ReviewItem {
   id: string;
   kind: "draft" | "proposal";
   status: string;
+  noteStatus?: string;
   scope: string | null;
   createdBy: string;
   createdAt: string;
@@ -79,16 +88,29 @@ export interface ReviewItemFilter {
   scope?: string;
   /** Pass "self" to resolve to AppContext.actor at call time. */
   createdBy?: string;
+  /** Review-plane vocabulary (see ReviewItem.status doc): "pending_review" matches both a
+   *  draft note and a pending_review proposal; "rejected" matches both kinds; "needs_rebase"
+   *  matches proposals only (no note ever has that status). */
   status?: string;
   limit?: number;
   cursor?: string | null;
   sort?: "created_at";
 }
 
+export interface ListReviewItemsResult {
+  items: ReviewItem[];
+  /** Last item's id when the page was full (== limit); pass back as `cursor` to continue.
+   *  null when there's nothing more to fetch (simple "maybe more" cursor, not exact). */
+  nextCursor: string | null;
+}
+
 export interface ReviewItemDetail {
   id: string;
   kind: "note" | "proposal";
+  /** Normalized status; see ReviewItem's doc comment. */
   status: string;
+  /** kind:"note" only: the note's actual notes.status (e.g. "draft" when status is "pending_review"). */
+  noteStatus?: string;
   usableAsContext: false;
   rejectionReason: string | null;
   draftReason?: string | null;
