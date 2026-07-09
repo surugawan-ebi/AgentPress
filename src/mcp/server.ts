@@ -1,0 +1,62 @@
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import type { AppContext } from "../core/context.js";
+import { registerGetRegistryOverviewTool } from "./tools/getRegistryOverview.js";
+import { registerSearchNotesTool } from "./tools/searchNotes.js";
+import { registerGetNoteTool } from "./tools/getNote.js";
+import { registerCreateNoteDraftTool } from "./tools/createNoteDraft.js";
+import { registerUpdateDraftTool } from "./tools/updateDraft.js";
+import { registerProposeNoteUpdateTool } from "./tools/proposeNoteUpdate.js";
+import { registerListReviewItemsTool } from "./tools/listReviewItems.js";
+import { registerGetReviewItemTool } from "./tools/getReviewItem.js";
+
+// Mirrors core/registry.ts's readServerVersion (not exported from there), so the MCP
+// Implementation.version reported to clients matches get_registry_overview's server_version.
+function readPackageVersion(): string {
+  try {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    // dist/mcp/server.js -> ../../package.json resolves to the repo root either way.
+    const pkgPath = path.join(here, "../../package.json");
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8")) as { version?: string };
+    return pkg.version ?? "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
+
+/**
+ * Assembles the McpServer and registers all 8 agent-facing tools (spec.md "Agent-facing MCP
+ * Tools"), without connecting a transport. Kept separate from startMcpServer so tests can call
+ * tool handlers directly without spawning a stdio process.
+ */
+export function buildMcpServer(ctx: AppContext): McpServer {
+  const server = new McpServer({ name: "agentpress", version: readPackageVersion() });
+
+  registerGetRegistryOverviewTool(server, ctx);
+  registerSearchNotesTool(server, ctx);
+  registerGetNoteTool(server, ctx);
+  registerCreateNoteDraftTool(server, ctx);
+  registerUpdateDraftTool(server, ctx);
+  registerProposeNoteUpdateTool(server, ctx);
+  registerListReviewItemsTool(server, ctx);
+  registerGetReviewItemTool(server, ctx);
+
+  return server;
+}
+
+/**
+ * Entry point used by `agentpress mcp`: builds the server and serves it over stdio.
+ * stdout is reserved for MCP protocol frames; all logging goes to stderr.
+ */
+export async function startMcpServer(ctx: AppContext): Promise<void> {
+  const server = buildMcpServer(ctx);
+  const transport = new StdioServerTransport();
+  process.stderr.write(
+    `[agentpress] starting MCP server (actor=${ctx.actor}, role=${ctx.role}, dataDir=${ctx.dataDir})\n`,
+  );
+  await server.connect(transport);
+  process.stderr.write("[agentpress] MCP server ready (stdio)\n");
+}
