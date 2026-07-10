@@ -8,11 +8,12 @@ const TOP_TAGS_LIMIT = 5;
 
 // Fixed MVP copy, matching spec.md's get_registry_overview example verbatim.
 const USAGE_POLICY =
-  "verified のみ正式根拠として使う。stale: true のnoteは要再確認として扱い、回答時にその旨を明示する。関連するverified noteが見つからない場合はcreate_note_draftで新規知識案を提案する。";
+  "verified のみ正式根拠として使う。stale: true のnoteは要再確認として扱い、回答時にその旨を明示する。関連するverified noteが見つからない場合はcreate_note_draftで新規知識案を提案する。古くなった/もう使うべきでないverified noteを見つけた場合は、recommend_archiveで人間にarchiveを提案する(内容修正の提案ではなくこちらを使う)。";
 const RECOMMENDED_FIRST_STEPS = [
   "get_registry_overview でscope構成とusage_policyを把握する",
   "search_notes で関連知識を検索する",
   "見つからなければcreate_note_draftで提案する",
+  "古い知識を見つけたらrecommend_archiveでarchiveを提案する",
 ];
 
 export interface RegistryScopeOverview {

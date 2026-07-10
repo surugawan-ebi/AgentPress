@@ -17,6 +17,7 @@ import {
 } from "./noteRows.js";
 import {
   ProposeUpdateInput,
+  RecommendArchiveInput,
   type Proposal,
   type CreateProposalResult,
   type ApproveResult,
@@ -27,7 +28,7 @@ import {
   type ListReviewItemsResult,
 } from "../types/proposal.js";
 import type { PolicyWarning } from "../types/policy.js";
-import type { Confidence, SourceInput } from "../types/common.js";
+import type { Confidence, ProposalType, SourceInput } from "../types/common.js";
 
 /** Default page size for listReviewItems when the caller doesn't specify one. */
 const DEFAULT_LIST_REVIEW_ITEMS_LIMIT = 20;
@@ -106,6 +107,7 @@ function noteDiffText(fields: { title: string; summary: string; body: string; ta
 
 export interface ReviewService {
   createProposal(input: ProposeUpdateInput): CreateProposalResult;
+  createArchiveRecommendation(input: RecommendArchiveInput): CreateProposalResult;
   approve(targetId: string, reason?: string): ApproveResult;
   reject(targetId: string, reason: string): RejectResult;
   listReviewItems(filter: ReviewItemFilter): ListReviewItemsResult;
@@ -288,6 +290,81 @@ export function createReviewService(ctx: AppContext): ReviewService {
       return { proposal: runCreate(), policyWarnings };
     },
 
+    createArchiveRecommendation(rawInput: RecommendArchiveInput): CreateProposalResult {
+      const input = parseOrThrow(RecommendArchiveInput, rawInput);
+      const note = requireNoteRow(input.note_id);
+
+      if (note.status === "archived") {
+        throw new AgentPressError("archived_target", `${input.note_id} is already archived`, {
+          details: { status: note.status },
+        });
+      }
+      if (note.status !== "verified") {
+        throw new AgentPressError(
+          "not_verified",
+          `${input.note_id} is ${note.status}, not verified. Only verified notes can receive an archive recommendation.`,
+          { details: { status: note.status }, suggested_action: "use update_draft/get_review_item for draft/rejected notes" },
+        );
+      }
+
+      const id = newId("proposal");
+      const now = new Date().toISOString();
+
+      const runCreate = db.transaction(() => {
+        // No content change: proposed_* stays null, diff is empty, changed_fields is [].
+        // The recommendation's substance lives entirely in `reason`.
+        const row: ProposalRow = {
+          id,
+          note_id: note.id,
+          status: "pending_review",
+          proposal_type: "archive_recommendation",
+          base_note_version: note.version,
+          proposed_title: null,
+          proposed_summary: null,
+          proposed_body: null,
+          proposed_tags_json: null,
+          proposed_scope: null,
+          proposed_confidence: null,
+          diff: "",
+          changed_fields_json: "[]",
+          reason: input.reason,
+          source_json: "[]",
+          proposed_by: actor,
+          reviewed_by: null,
+          created_at: now,
+          reviewed_at: null,
+          rejection_reason: null,
+        };
+        db.prepare(
+          `INSERT INTO update_proposals
+             (id, note_id, status, proposal_type, base_note_version, proposed_title, proposed_summary,
+              proposed_body, proposed_tags_json, proposed_scope, proposed_confidence, diff,
+              changed_fields_json, reason, source_json, proposed_by, reviewed_by, created_at,
+              reviewed_at, rejection_reason)
+           VALUES
+             (@id, @note_id, @status, @proposal_type, @base_note_version, @proposed_title, @proposed_summary,
+              @proposed_body, @proposed_tags_json, @proposed_scope, @proposed_confidence, @diff,
+              @changed_fields_json, @reason, @source_json, @proposed_by, @reviewed_by, @created_at,
+              @reviewed_at, @rejection_reason)`,
+        ).run(row);
+
+        history.record({
+          entityType: "proposal",
+          entityId: id,
+          eventType: "proposal_created",
+          actor,
+          role,
+          scope: note.scope,
+          reason: input.reason,
+          afterSnapshot: { proposal: row },
+        });
+
+        return rowToProposal(row);
+      });
+
+      return { proposal: runCreate(), policyWarnings: [] };
+    },
+
     approve(targetId: string, reason?: string): ApproveResult {
       if (targetId.startsWith("note_")) return approveNoteDraft(targetId, reason);
       if (targetId.startsWith("proposal_")) return approveProposal(targetId, reason);
@@ -390,10 +467,14 @@ export function createReviewService(ctx: AppContext): ReviewService {
             id: row.id,
             kind: "proposal",
             status: row.status,
+            proposalType: row.proposal_type as ProposalType,
             scope: row.note_scope,
             createdBy: row.proposed_by,
             createdAt: row.created_at,
-            title: `Update: ${row.note_title}`,
+            title:
+              row.proposal_type === "archive_recommendation"
+                ? `Archive recommendation: ${row.note_title}`
+                : `Update: ${row.note_title}`,
             hasWarnings: warnings.length > 0,
             hasDuplicates: false,
           });
@@ -443,6 +524,7 @@ export function createReviewService(ctx: AppContext): ReviewService {
           id: proposal.id,
           kind: "proposal",
           status: proposal.status,
+          proposalType: proposal.proposal_type as ProposalType,
           usableAsContext: false,
           rejectionReason: proposal.rejection_reason,
           policyWarnings: proposalPolicyWarnings(note, tags, proposal),
@@ -457,7 +539,10 @@ export function createReviewService(ctx: AppContext): ReviewService {
           changedFields: JSON.parse(proposal.changed_fields_json),
         };
         if (proposal.status === "needs_rebase") {
-          detail.suggestedAction = "fetch current note and resubmit";
+          detail.suggestedAction =
+            proposal.proposal_type === "archive_recommendation"
+              ? "the note is no longer verified; check its current status and resubmit recommend_archive if still applicable"
+              : "fetch current note and resubmit";
         }
         return detail;
       }
@@ -548,6 +633,12 @@ export function createReviewService(ctx: AppContext): ReviewService {
     );
   }
 
+  /**
+   * approve(targetId) for a proposal_* id: shared status check, then dispatches on
+   * proposal_type. "update" applies proposed_* content changes to the note (the original
+   * behavior); "archive_recommendation" has no content to apply and instead archives the
+   * target note itself (see approveArchiveRecommendation).
+   */
   function approveProposal(id: string, reason?: string): ApproveResult {
     const proposal = requireProposalRow(id);
     if (proposal.status !== "pending_review") {
@@ -557,6 +648,13 @@ export function createReviewService(ctx: AppContext): ReviewService {
         { details: { status: proposal.status }, suggested_action: "fetch current note and resubmit" },
       );
     }
+    if (proposal.proposal_type === "archive_recommendation") {
+      return approveArchiveRecommendation(proposal, reason);
+    }
+    return approveUpdateProposal(proposal, reason);
+  }
+
+  function approveUpdateProposal(proposal: ProposalRow, reason?: string): ApproveResult {
     const note = requireNoteRow(proposal.note_id);
     if (note.status === "archived") {
       throw new AgentPressError("archived_target", `${proposal.note_id} is archived`, {
@@ -695,6 +793,143 @@ export function createReviewService(ctx: AppContext): ReviewService {
       proposal: result.proposal,
       cascadedNeedsRebase: result.cascaded,
       policyWarnings,
+    };
+  }
+
+  /**
+   * needs_rebase fallback for an archive_recommendation whose target note is no longer
+   * verified by the time it's approved (already archived by someone else, or -- in
+   * principle -- otherwise moved off "verified"). Mirrors markNeedsRebaseAndThrow's
+   * commit-then-throw shape, but the lock this proposal type cares about is note.status,
+   * not note.version (there's no content to apply, so no version-based optimistic lock).
+   */
+  function markArchiveRecommendationNeedsRebaseAndThrow(proposal: ProposalRow, note: NoteRow, reason: string | undefined): never {
+    const markNeedsRebase = db.transaction(() => {
+      db.prepare("UPDATE update_proposals SET status='needs_rebase' WHERE id=?").run(proposal.id);
+      history.record({
+        entityType: "proposal",
+        entityId: proposal.id,
+        eventType: "proposal_needs_rebase",
+        actor,
+        role,
+        scope: note.scope,
+        reason: reason ?? null,
+        beforeSnapshot: { proposal },
+        afterSnapshot: { proposal: { ...proposal, status: "needs_rebase" } },
+      });
+    });
+    markNeedsRebase();
+    throw new AgentPressError(
+      "version_conflict",
+      `archive recommendation ${proposal.id} cannot be applied: ${note.id} is no longer verified (current status: ${note.status})`,
+      {
+        details: { current_status: note.status },
+        retryable: true,
+        suggested_action: "check the note's current status via get_review_item; resubmit recommend_archive if it's verified again",
+      },
+    );
+  }
+
+  /**
+   * Approving an archive_recommendation has no content to apply -- it archives the target
+   * note itself. The optimistic lock is "note.status is still verified" (checked atomically
+   * via the UPDATE's WHERE clause below), not a version match: an unrelated content update
+   * approved in the meantime doesn't invalidate this recommendation, only the note no
+   * longer being verified does. Cascades to other pending proposals on the same note
+   * exactly like approveUpdateProposal does, since none of them can apply to an archived note.
+   */
+  function approveArchiveRecommendation(proposal: ProposalRow, reason?: string): ApproveResult {
+    const note = requireNoteRow(proposal.note_id);
+    if (note.status === "archived") {
+      throw new AgentPressError("archived_target", `${proposal.note_id} is already archived`, {
+        details: { status: note.status },
+      });
+    }
+    if (note.status !== "verified") {
+      markArchiveRecommendationNeedsRebaseAndThrow(proposal, note, reason);
+    }
+
+    const now = new Date().toISOString();
+    const runApprove = db.transaction(() => {
+      const beforeSnapshot = buildNoteSnapshot(db, note);
+      const updatedNote: NoteRow = { ...note, status: "archived", archived_at: now, updated_at: now };
+
+      const updateResult = db
+        .prepare("UPDATE notes SET status='archived', archived_at=@archived_at, updated_at=@updated_at WHERE id=@id AND status='verified'")
+        .run({ id: note.id, archived_at: now, updated_at: now });
+
+      if (updateResult.changes !== 1) {
+        throw new ApproveVersionMismatch();
+      }
+
+      const updatedProposal: ProposalRow = { ...proposal, status: "approved", reviewed_by: actor, reviewed_at: now };
+      db.prepare("UPDATE update_proposals SET status='approved', reviewed_by=@reviewed_by, reviewed_at=@reviewed_at WHERE id=@id").run(
+        { id: proposal.id, reviewed_by: actor, reviewed_at: now },
+      );
+
+      history.record({
+        entityType: "note",
+        entityId: note.id,
+        eventType: "note_archived",
+        actor,
+        role,
+        scope: note.scope,
+        reason: reason ?? proposal.reason,
+        beforeSnapshot,
+        afterSnapshot: buildNoteSnapshot(db, updatedNote),
+      });
+      history.record({
+        entityType: "proposal",
+        entityId: proposal.id,
+        eventType: "proposal_approved",
+        actor,
+        role,
+        scope: note.scope,
+        reason: reason ?? null,
+        beforeSnapshot: { proposal },
+        afterSnapshot: { proposal: updatedProposal },
+      });
+
+      const others = db
+        .prepare("SELECT * FROM update_proposals WHERE note_id = ? AND status = 'pending_review' AND id != ?")
+        .all(note.id, proposal.id) as ProposalRow[];
+      const cascaded: string[] = [];
+      for (const other of others) {
+        db.prepare("UPDATE update_proposals SET status='needs_rebase' WHERE id=?").run(other.id);
+        history.record({
+          entityType: "proposal",
+          entityId: other.id,
+          eventType: "proposal_needs_rebase",
+          actor,
+          role,
+          scope: note.scope,
+          reason: `note archived via ${proposal.id}`,
+          beforeSnapshot: { proposal: other },
+          afterSnapshot: { proposal: { ...other, status: "needs_rebase" } },
+        });
+        cascaded.push(other.id);
+      }
+
+      return { note: rowToNote(updatedNote), proposal: rowToProposal(updatedProposal), cascaded };
+    });
+
+    let result: { note: import("../types/note.js").Note; proposal: Proposal; cascaded: string[] };
+    try {
+      result = runApprove();
+    } catch (err) {
+      if (err instanceof ApproveVersionMismatch) {
+        const freshNote = requireNoteRow(proposal.note_id);
+        markArchiveRecommendationNeedsRebaseAndThrow(proposal, freshNote, reason);
+      }
+      throw err;
+    }
+
+    return {
+      kind: "proposal",
+      note: result.note,
+      proposal: result.proposal,
+      cascadedNeedsRebase: result.cascaded,
+      policyWarnings: [],
     };
   }
 

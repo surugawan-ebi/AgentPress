@@ -13,6 +13,9 @@ export type ScopeConfig = z.infer<typeof ScopeConfig>;
 export const RequiredVerifyField = z.enum(["source", "confidence", "owner"]);
 export type RequiredVerifyField = z.infer<typeof RequiredVerifyField>;
 
+export const SearchEngineMode = z.enum(["auto", "like", "fts5"]);
+export type SearchEngineMode = z.infer<typeof SearchEngineMode>;
+
 export const AgentPressConfigSchema = z.object({
   default_search_status: z.literal("verified").default("verified"),
   strict_stale_filter: z.boolean().default(false),
@@ -22,6 +25,10 @@ export const AgentPressConfigSchema = z.object({
   note_body_max_chars: z.number().int().positive().default(8000),
   scopes: z.record(z.string(), ScopeConfig).default({}),
   default_actor: z.string().optional(),
+  // "auto": use FTS5(trigram) when this SQLite build supports it, else LIKE.
+  // "like": always the LIKE engine. "fts5": require FTS5(trigram); errors at search-engine
+  // construction time (not a silent LIKE fallback) if this environment doesn't support it.
+  search_engine: SearchEngineMode.default("auto"),
 });
 export type AgentPressConfig = z.infer<typeof AgentPressConfigSchema>;
 
@@ -51,6 +58,10 @@ default_review_interval_days: 90
 required_fields_for_verify: [source, confidence, owner]
 reviewer_separation: warn
 note_body_max_chars: 8000
+# auto: FTS5(trigram) when this SQLite build supports it, else LIKE. like: always LIKE.
+# fts5: require FTS5(trigram); fails clearly at startup if unsupported instead of
+# silently falling back.
+search_engine: auto
 scopes:
   support:
     description: ""

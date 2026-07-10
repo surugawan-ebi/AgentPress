@@ -38,7 +38,7 @@ agentpress/（このrepo直下）
       render.ts               # テーブル/diff等の表示ヘルパ
     mcp/
       server.ts               # McpServer 組み立て + stdio 起動
-      tools/{getRegistryOverview,searchNotes,getNote,createNoteDraft,updateDraft,proposeNoteUpdate,listReviewItems,getReviewItem}.ts
+      tools/{getRegistryOverview,searchNotes,getNote,createNoteDraft,updateDraft,proposeNoteUpdate,recommendArchive,listReviewItems,getReviewItem,getNoteHistory}.ts
       idempotency.ts          # mutating tool 共通ラッパ
     core/
       context.ts              # AppContext（db, config, actor, role）生成
@@ -48,7 +48,7 @@ agentpress/（このrepo直下）
       ids.ts                  # newId('note'|'proposal'|'hist'|'src'|'batch')
     db/
       client.ts               # openDb: WAL, busy_timeout=5000, foreign_keys=ON
-      migrations.ts           # migration runner + 001_init
+      migrations.ts           # migration runner + 001_init + 002_fts5_search
       schema.sql              # 参照用DDL（正はmigrations）
     config/
       config.ts               # loadConfig + zod schema + defaults
@@ -120,7 +120,7 @@ CREATE TABLE update_proposals (
   status TEXT NOT NULL DEFAULT 'pending_review'
     CHECK (status IN ('pending_review','approved','rejected','needs_rebase')),
   proposal_type TEXT NOT NULL DEFAULT 'update'
-    CHECK (proposal_type IN ('update','archive_recommendation')),  -- 後者はPhase 2
+    CHECK (proposal_type IN ('update','archive_recommendation')),  -- 後者はrecommend_archiveが生成
   base_note_version INTEGER NOT NULL,
   proposed_title TEXT, proposed_summary TEXT, proposed_body TEXT,
   proposed_tags_json TEXT, proposed_scope TEXT,
@@ -181,9 +181,39 @@ CREATE TABLE schema_migrations (
 );
 ```
 
+migration 002（`002_fts5_search`）で以下を追加。SQLite が FTS5 + trigram tokenizer をサポートしない環境でも `agentpress init` 自体は失敗させたくないため、この migration の本体は **best-effort**（ネストした `db.transaction()` = SAVEPOINT を外側の try/catch で包み、失敗時は `notes_fts` が単に存在しないままになる）にする。migration自体は「適用済み」として `schema_migrations` に記録される（DDL失敗を握りつぶすだけで、migration runner 自体は失敗させない）。
+
+```sql
+CREATE VIRTUAL TABLE notes_fts USING fts5(
+  search_text,
+  content='notes',
+  content_rowid='rowid',
+  tokenize='trigram'
+);
+
+CREATE TRIGGER notes_fts_ai AFTER INSERT ON notes BEGIN
+  INSERT INTO notes_fts(rowid, search_text) VALUES (new.rowid, new.search_text);
+END;
+
+CREATE TRIGGER notes_fts_ad AFTER DELETE ON notes BEGIN
+  INSERT INTO notes_fts(notes_fts, rowid, search_text) VALUES('delete', old.rowid, old.search_text);
+END;
+
+CREATE TRIGGER notes_fts_au AFTER UPDATE ON notes BEGIN
+  INSERT INTO notes_fts(notes_fts, rowid, search_text) VALUES('delete', old.rowid, old.search_text);
+  INSERT INTO notes_fts(rowid, search_text) VALUES (new.rowid, new.search_text);
+END;
+
+INSERT INTO notes_fts(notes_fts) VALUES('rebuild');
+```
+
+- `notes_fts` は外部コンテンツ型（`content='notes'`）の FTS5 仮想テーブルで、`search_text` 列だけを索引化する。`notes.id` は `TEXT PRIMARY KEY` なので、SQLite の暗黙 `rowid` を `notes_fts.rowid` との JOIN キーにして note id を解決する（`SELECT n.* FROM notes_fts JOIN notes n ON n.rowid = notes_fts.rowid WHERE notes_fts MATCH ?`）
+- 外部コンテンツテーブルは自動同期されないため、`notes` への INSERT/UPDATE/DELETE を3本のトリガーで `notes_fts` に反映する。UPDATE は「旧 `search_text` を `'delete'` コマンドで消してから、新しい行を insert」という外部コンテンツテーブルの標準パターンに従う
+- `search.ts` の `hasFts5TrigramSupport(db)` は `sqlite_master` に `notes_fts` テーブルが存在するかで対応可否を判定する（migration が failed-safe で握りつぶした場合は存在しない）
+
 方針:
 
-- `notes.version` は正式知識に影響する変更（title/summary/body/tags/scope/confidence の適用）ごとに +1。draft 段階の `update_draft` でも +1 してよい（単調増加が保てればよい。proposal の optimistic lock は verified note にしか使われない）
+- `notes.version` は正式知識に影響する変更（title/summary/body/tags/scope/confidence の適用）ごとに +1。draft 段階の `update_draft` でも +1 してよい（単調増加が保てればよい。proposal の optimistic lock は verified note にしか使われない）。`archive_recommendation` proposal の approve は内容変更ではないため `version` を変えない
 - event_type 一覧: `note_created` `note_updated` `note_verified` `note_rejected` `note_resubmitted` `note_archived` `proposal_created` `proposal_approved` `proposal_rejected` `proposal_needs_rebase` `note_imported` `note_exported`
 - history の snapshot は note/proposal の行 + tags/sources を JSON 化して冗長に保存する
 
@@ -198,12 +228,19 @@ default_review_interval_days: 90
 required_fields_for_verify: [source, confidence, owner]
 reviewer_separation: warn        # warn | enforce（MVPはwarnのみ実装）
 note_body_max_chars: 8000        # 超過で body_too_long 警告
+search_engine: auto              # auto | like | fts5
 scopes:
   support:
     description: ""
     owners: []
     reviewers: []
 ```
+
+`search_engine`:
+
+- `auto`（デフォルト）: `hasFts5TrigramSupport(db)` が true なら `Fts5SearchEngine`、false なら `LikeSearchEngine`
+- `like`: 常に `LikeSearchEngine`
+- `fts5`: 常に `Fts5SearchEngine` を要求する。非対応環境では `createSearchEngine()` 呼び出し時点（MCPサーバはサーバ構築時、CLIはコマンドごとのプロセス起動時）に `invalid_input` エラーで落ち、`like` へ黙ってフォールバックしない
 
 - 解決順: CLI は `--actor` > env `AGENTPRESS_ACTOR` > config `default_actor` > OS user。role は `--role` > env `AGENTPRESS_ROLE` > `contributor`（approve/reject/archive コマンドは既定 `reviewer`）
 - MCP server は起動時に `--actor` / env を読み、**tool 入力からは一切受けない**
@@ -214,7 +251,7 @@ scopes:
 
 `AgentPressError extends Error`: `{ code, message, details?, retryable, suggested_action? }`。MCP tool ではこれを JSON で返し（`isError: true`）、CLI では人間向けに整形する。
 
-エラーコード: `not_found` `not_verified` `invalid_input` `empty_change` `version_conflict` `archived_target` `rejected_target` `not_draft_owner` `slug_conflict`(import時のみ) `io_error`
+エラーコード: `not_found` `not_verified` `invalid_input` `empty_change` `version_conflict` `archived_target` `rejected_target` `not_draft_owner` `slug_conflict`(import時のみ) `io_error` `in_progress`(idempotency_key が使用中。version_conflict とは別系統)
 
 policy_warnings コード（`{code, message, suggested_action}`）: `missing_source` `weak_source_for_high_confidence` `body_too_long` `missing_headings` `summary_too_short`(< 20文字) `tags_too_sparse`(0個) `reviewer_separation` `stale_note`
 
@@ -236,22 +273,43 @@ createProposal(input: ProposeUpdateInput): { proposal: Proposal; policyWarnings:
 //   verified限定, 空変更はempty_change。input.base_note_version は必須:
 //   現在のnote.versionと不一致なら version_conflict エラーを返し、proposalを作らない
 //   （AIが古いget_note結果を基に提案するのを作成時点で検出する。approve時のlockは別途維持）
-approve(targetId, reason?): ApproveResult      // note_→draft承認 / proposal_→反映。version検証→needs_rebaseカスケード
-reject(targetId, reason): RejectResult         // note_→rejected / proposal_→rejected
+createArchiveRecommendation(input: RecommendArchiveInput): { proposal: Proposal; policyWarnings: [] }
+//   verified限定（draft/rejectedはnot_verified、archivedはarchived_target）。
+//   proposed_*は使わずnull、diffは""、changed_fieldsは[]。reasonが実質的な提案内容。
+//   base_note_versionは記録するが、approve時のlockには使わない（下記approve参照）
+approve(targetId, reason?): ApproveResult      // note_→draft承認 / proposal_→反映（proposal_typeで分岐）
+//   proposal_type:"update"は従来どおりversion検証→needs_rebaseカスケード。
+//   proposal_type:"archive_recommendation"は「対象noteが依然verifiedであること」をロック条件にし、
+//   成立すれば対象noteをarchivedにする（version・内容は変えない）。不成立ならneeds_rebase化して
+//   version_conflict相当のエラーを返す（markArchiveRecommendationNeedsRebaseAndThrow）。
+//   どちらの承認も、同一noteの他のpending proposal（type問わず）をneeds_rebaseにカスケードする
+reject(targetId, reason): RejectResult         // note_→rejected / proposal_→rejected（proposal_type問わず同じ処理）
 listReviewItems(filter): { items: ReviewItem[]; nextCursor: string | null }
 //   kind/scope/created_by("self")/status/limit(省略時20)/cursor/sort。
 //   status はレビュー系語彙に正規化: draft noteは"pending_review"として返し、元のnotes.statusは
 //   kind:"draft"の項目のみnoteStatusで保持。filterのstatus:"pending_review"はdraft note+
 //   pending_reviewなproposalの両方に、"rejected"は両方のrejectedにマッチ、"needs_rebase"はproposal限定。
+//   kind:"proposal"の項目にはproposalType("update"|"archive_recommendation")が付き、
+//   titleも"Archive recommendation: ..."/"Update: ..."で区別される。
 //   結果がちょうどlimit件のときnextCursorに最後のidを返す（簡易cursor、正確な残件判定はしない）
-getReviewItem(id): ReviewItemDetail            // usable_as_context:false, needs_rebase時は復旧情報。statusはlistReviewItemsと同じ正規化+noteStatus
+getReviewItem(id): ReviewItemDetail            // usable_as_context:false, needs_rebase時は復旧情報。statusはlistReviewItemsと同じ正規化+noteStatus+proposalType
 
 // search.ts
 interface SearchEngine { search(input: SearchInput): SearchResult }
+createSearchEngine(ctx: AppContext): SearchEngine
+//   ctx.config.search_engineに従いLike/Fts5を選択するfactory。"fts5"明示時は
+//   hasFts5TrigramSupport(db)がfalseだと即invalid_inputで落ちる（MCPサーバ構築時に呼ぶことで起動時エラーにする）
 LikeSearchEngine
 //   notes.search_text（NFKC+lowercase済みshadow column）に対するSQL LIKEで候補を絞り、
-//   ヒット行のみJSでフィールド別に再マッチして matched_fields / snippet(マッチ前後~60字) を計算する。
+//   ヒット行のみJSでフィールド別に再マッチして matched_fields / snippet(マッチ前後~60字) / score:null を計算する。
 //   verified固定, include_archived, stale付与。search_textはnotes書き込み時に必ず再計算する
+Fts5SearchEngine
+//   正規化後のクエリ語のうち3文字以上をnotes_fts MATCH（各語をフレーズクォート、OR連結）にかけ、
+//   3文字未満の語・MATCH構文エラー時の語はLikeSearchEngineと同じLIKE候補収集にフォールバックする。
+//   FTS候補とLIKE候補をunionし、LikeSearchEngineと共通のscoreCandidates/finalizeResultsで
+//   matched_fields/snippetを計算する（no_resultsはフォールバック後の最終結果に対して判定）。
+//   scoreはFTSでヒットした行だけ -bm25(notes_fts)（大きいほど良い）、LIKEのみの行はnull。
+//   並び順はscoreを持つ行を降順で先に、持たない行を既存のmatchedTermCount/updated_at順で後に
 
 // policy.ts
 checkDraft(note): PolicyWarning[]              // 粒度/summary/tags/source品質
@@ -279,13 +337,16 @@ changedFields(input, note): string[]
 
 `approve` の処理順: 対象判定 → policy 検証（警告収集）→ reviewer separation 警告 → proposal なら `base_note_version === note.version` の事前チェック（安価な早期リターン用で、複数プロセス間の TOCTOU に対しては脆弱なため正しさの保証には使わない）。**不一致の場合は「当該 proposal を `needs_rebase` に更新 + history 記録」だけを独立トランザクションで commit してから `version_conflict` エラーを返す**（better-sqlite3 の transaction は throw で rollback されるため、状態更新とエラー送出を同一 tx に入れない）。事前チェックが一致した場合は 1 トランザクションで: `UPDATE notes ... WHERE id=@id AND version=@base_note_version AND status='verified'` を実行して `changes === 1` を検証する（これが実際の楽観ロック本体。0 件なら別プロセスがその間に version を進めたということなので、専用の例外を投げてこのトランザクションをロールバックし、事前チェック不一致時と同じ「needs_rebase 更新 + history を独立トランザクションで commit → `version_conflict`」経路にフォールバックする。フォールバック時は `note.version` を再取得してエラーメッセージに使う）。`changes === 1` なら同一トランザクション内で: note へ反映（`version+1` / `verified_at` / `review_due_at` 更新）→ `proposal.source` の各エントリを `note_sources` へ追記マージ（`type`+`url`+`path` が完全一致する既存行はスキップして重複を防ぐ。置き換えではなく追加）→ proposal を `approved` に → 同一 note の他 pending proposal を `needs_rebase` に + `proposal_needs_rebase` イベント → history 記録。draft note の承認も同様に `version+1` する（内容は変わらないが、spec.md の承認手順どおり単調増加を保つ）。note 系 history event の `before_snapshot_json`/`after_snapshot_json` は `noteRows.ts` の `buildNoteSnapshot(db, noteRow)`（`{note, tags, sources}`）に統一し、`note` 行だけでなく tags/sources も必ず含める。
 
+`proposal_type: "archive_recommendation"` の approve は上記と別経路（`approveArchiveRecommendation`）にする: 事前チェック/楽観ロックの対象は `version` ではなく `note.status`。対象 note を再取得し、`status === "archived"` なら `archived_target`、`status !== "verified"`（他のarchive経路で既に非verifiedになっていた場合）なら通常経路と同じ「needs_rebase 更新 + history を独立トランザクションで commit → `version_conflict`」にフォールバックする（`markArchiveRecommendationNeedsRebaseAndThrow`）。ロックが成立した場合は `UPDATE notes SET status='archived', archived_at=?, updated_at=? WHERE id=? AND status='verified'` で `changes === 1` を検証し（同一パターンの楽観ロック）、成立したら `note_archived` + `proposal_approved` の history を記録し、同一 note の他 pending proposal（`update`/`archive_recommendation` 問わず）を `needs_rebase` にカスケードする。内容フィールドの更新も `note_sources` への追記もない。
+
 ## MCP server 設計
 
-- `McpServer` に 8 tool を登録。tool ごとに zod の input schema **と outputSchema** を定義し、description には「draft/review item を正式根拠に使わない」「0件時の挙動」「stale の扱い」を明記する
+- `McpServer` に 10 tool を登録。tool ごとに zod の input schema **と outputSchema** を定義し、description には「draft/review item を正式根拠に使わない」「0件時の挙動」「stale の扱い」を明記する
 - レスポンスは `structuredContent`（構造化 JSON）を正とし、`content: [{type:"text", text: JSON.stringify(result)}]` を fallback として併記。エラーは `isError: true` + エラー JSON
-- mutating tool（create_note_draft / update_draft / propose_note_update）は `idempotency.ts` のラッパを通す。予約は `(key, tool, actor)` 単位（同一keyでもactorが違えば別予約。MCPサーバはactorごとに別プロセスで起動するため）。フロー: (1) 短い独立トランザクションで予約行を INSERT して即 commit し、他プロセスからも `in_progress` が見えるようにする（既存行あり: `completed` なら保存済み結果を返す。`in_progress` かつ10分以内なら `in_progress` retryable エラー。10分より古い`in_progress`は放棄されたとみなし上書きして予約を取得する。`request_hash` 不一致なら `invalid_input`）→ (2) 予約 tx の外で mutation を実行（失敗時は `finally` で予約行を削除しリトライ可能にする）→ (3) 成功時に `result_json` を保存し `completed` に更新
+- mutating tool（create_note_draft / update_draft / propose_note_update / recommend_archive）は `idempotency.ts` のラッパを通す。予約は `(key, tool, actor)` 単位（同一keyでもactorが違えば別予約。MCPサーバはactorごとに別プロセスで起動するため）。フロー: (1) 短い独立トランザクションで予約行を INSERT して即 commit し、他プロセスからも `in_progress` が見えるようにする（既存行あり: `completed` なら保存済み結果を返す。`in_progress` かつ10分以内なら `in_progress` retryable エラー。10分より古い`in_progress`は放棄されたとみなし上書きして予約を取得する。`request_hash` 不一致なら `invalid_input`）→ (2) 予約 tx の外で mutation を実行（失敗時は `finally` で予約行を削除しリトライ可能にする）→ (3) 成功時に `result_json` を保存し `completed` に更新。`get_note_history` は読み取り専用のため idempotency ラッパを通さない
 - `propose_note_update` の入力に `base_note_version`（必須）を追加。get_note の citation.version をそのまま渡す想定
-- search_notes の 0 件時は仕様どおり `no_results: true` / `guidance` / `suggested_next_tools` / `searched_statuses`
+- `buildMcpServer(ctx)` は tool 登録の前に `createSearchEngine(ctx)` を1回呼ぶ（結果は破棄。`search_notes` は呼び出しごとに自分でも構築する）。これにより `search_engine: "fts5"` を明示指定した環境が非対応の場合、サーバ構築時点（`agentpress mcp` 起動時）で即エラーになり、最初の検索まで気づかないという事態を防ぐ
+- search_notes の 0 件時は仕様どおり `no_results: true` / `guidance` / `suggested_next_tools` / `searched_statuses`（FTS→LIKEフォールバック適用後の最終結果に対して判定）
 - citation は `{label, note_id, version, updated_at, review_due_at, stale, confidence, status, scope}` を共通ヘルパで生成
 - `agentpress mcp` コマンドが `StdioServerTransport` で起動。stdout は MCP protocol 専用、ログは stderr
 
@@ -324,9 +385,11 @@ frontmatter は spec.md の Knowledge Note 例に従う（id, slug, title, type,
 
 ## テスト計画
 
-- unit: ids / diff / policy(各警告コード) / duplicates / search(NFKC・日本語部分一致・stale 付与・include_archived) / markdown(roundtrip・衝突・status分岐)
+- unit: ids / diff / policy(各警告コード) / duplicates / search(NFKC・日本語部分一致・stale 付与・include_archived、LikeSearchEngine) / markdown(roundtrip・衝突・status分岐)
+- unit: search FTS5(3文字以上のMATCH, 2文字以下のLIKEフォールバック, 混在クエリのunion, scoreの符号/null, auto probe, 明示fts5+非対応環境エラー, update/import経路でのnotes_fts同期)
 - service: notes(draft作成→update_draft→再提出) / reviews(draft approve, proposal approve, version_conflict, needs_rebase カスケード, reject, empty_change, 他人draft拒否)
-- mcp: tool handler を直接呼ぶ（server 起動なし）。idempotency の重複実行、get_note の not_verified、search 0件、citation フィールド
+- service: reviews archive_recommendation(create→approve→noteがarchived+双方向needs_rebaseカスケード, reject, not_verified/archived_targetエラー, idempotency)
+- mcp: tool handler を直接呼ぶ（server 起動なし）。idempotency の重複実行、get_note の not_verified、search 0件、citation フィールド、recommend_archive、get_note_history
 - cli: commander を programmatic に実行。テストごとに fresh な `Command` を factory（`buildProgram()`）で生成し、`exitOverride()` + `configureOutput()` で exit と出力を capture する。tmp dir で init→import→approve→search→export の統合フロー
 - DB は各テストで tmp ファイル or `:memory:`（migration は共通）
 - ESM/NodeNext のため、相対 import には必ず `.js` 拡張子を付ける（`import { x } from "./notes.js"`）
@@ -338,9 +401,10 @@ frontmatter は spec.md の Knowledge Note 例に従う（id, slug, title, type,
 3. **Phase 3a**: CLI 全コマンド + render + 統合テスト（3b と並行可。src/cli/ と tests/cli* のみ触る）
 4. **Phase 3b**: MCP server + 8 tools + idempotency + tests（3a と並行可。src/mcp/ と tests/mcp* のみ触る）
 5. **Phase 4**: examples/support-vault + README + E2E 検証（実 CLI 実行 + MCP stdio 疎通）+ 完了条件チェック
+6. **Phase 2 機能追加**（初期MVP完了後）: migration 002（`notes_fts` + トリガー）+ `Fts5SearchEngine` + `search_engine`設定 + `recommend_archive`（reviews.ts / MCP tool / CLI表示）+ `get_note_history`（MCP tool）+ MCP 8→10 tools + docs/README更新 + version 0.2.0
 
 Phase 1 で全依存を package.json に入れる（後続 phase は package.json を触らない）。
 
 ## 完了条件
 
-spec.md の Completion Criteria に従う: `npm install` / `npm run build` / `npm test` が通る、`agentpress init` で初期化できる、`agentpress mcp` で MCP サーバが起動する、8 tools が使える、CLI で検索・表示・承認・却下・archive ができる、Markdown export/import ができる、README が書かれている、example vault が同梱されている。
+spec.md の Completion Criteria に従う: `npm install` / `npm run build` / `npm test` が通る、`agentpress init` で初期化できる、`agentpress mcp` で MCP サーバが起動する、10 tools が使える、CLI で検索・表示・承認・却下・archive ができる、Markdown export/import ができる、README が書かれている、example vault が同梱されている。

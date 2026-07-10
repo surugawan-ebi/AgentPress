@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import { runCli, setupTmpProject, writeSeedFile, readNoteIds, readProposalIds } from "./helpers.js";
+import { createContext } from "../../src/core/context.js";
+import { createReviewService } from "../../src/core/reviews.js";
 
 const seedMarkdown = `---
 title: "返金ポリシー"
@@ -136,5 +138,47 @@ describe("agentpress CLI end-to-end flow", () => {
 
     const showNote = await runCli(["show", noteId]);
     expect(showNote.stdout).toContain("特例として60日まで延長");
+  });
+
+  it("distinguishes an archive_recommendation proposal in list --pending / show, and approving it archives the note", async () => {
+    await runCli(["init"]);
+    const seedDir = path.join(project.dir, "seed");
+    writeSeedFile(seedDir, "refund.md", seedMarkdown);
+    await runCli(["import", seedDir]);
+    const [noteId] = readNoteIds(project.dir, { status: "draft" });
+    await runCli(["approve", noteId, "--actor", "human:reviewer", "--reason", "ok"]);
+
+    // recommend_archive is MCP-only (agent-facing); simulate what the MCP tool does by
+    // calling the same core service directly against the CLI's own project dir/db.
+    const agentCtx = createContext({ actor: "agent:codex" });
+    let proposalId: string;
+    try {
+      const reviews = createReviewService(agentCtx);
+      const { proposal } = reviews.createArchiveRecommendation({
+        note_id: noteId,
+        reason: "2026年の制度改定により内容が古くなったため",
+      });
+      proposalId = proposal.id;
+    } finally {
+      agentCtx.db.close();
+    }
+
+    const pendingResult = await runCli(["list", "--pending"]);
+    expect(pendingResult.exitCode).toBe(0);
+    expect(pendingResult.stdout).toContain(proposalId);
+    expect(pendingResult.stdout).toContain("proposal:archive");
+    expect(pendingResult.stdout).toContain("Archive recommendation");
+
+    const showResult = await runCli(["show", proposalId]);
+    expect(showResult.exitCode).toBe(0);
+    expect(showResult.stdout).toContain("ARCHIVE RECOMMENDATION");
+    expect(showResult.stdout).toContain("2026年の制度改定により内容が古くなったため");
+
+    const approveResult = await runCli(["approve", proposalId, "--actor", "human:reviewer2", "--reason", "confirmed"]);
+    expect(approveResult.exitCode).toBe(0);
+    expect(approveResult.stdout).toContain("Approved");
+
+    const archivedIds = readNoteIds(project.dir, { status: "archived" });
+    expect(archivedIds).toEqual([noteId]);
   });
 });

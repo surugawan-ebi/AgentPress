@@ -9,6 +9,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
@@ -65,19 +66,21 @@ async function main() {
     const expected = [
       "create_note_draft",
       "get_note",
+      "get_note_history",
       "get_registry_overview",
       "get_review_item",
       "list_review_items",
       "propose_note_update",
+      "recommend_archive",
       "search_notes",
       "update_draft",
     ];
     assert(
       expected.every((name) => toolNames.includes(name)),
-      `expected all 8 tools, got: ${toolNames.join(", ")}`,
+      `expected all 10 tools, got: ${toolNames.join(", ")}`,
     );
-    assert(toolNames.length === 8, `expected exactly 8 tools, got ${toolNames.length}: ${toolNames.join(", ")}`);
-    ok(`tools/list returned all 8 expected tools: ${toolNames.join(", ")}`);
+    assert(toolNames.length === 10, `expected exactly 10 tools, got ${toolNames.length}: ${toolNames.join(", ")}`);
+    ok(`tools/list returned all 10 expected tools: ${toolNames.join(", ")}`);
 
     step = "get_registry_overview";
     const overview = await client.callTool({ name: "get_registry_overview", arguments: {} });
@@ -129,6 +132,86 @@ async function main() {
     const errorPayload = JSON.parse(getDraftAsNote.content[0].text);
     assert(errorPayload.code === "not_verified", `expected not_verified, got ${errorPayload.code}`);
     ok(`get_note on a draft correctly errors: code=${errorPayload.code}`);
+
+    step = "get_note_history on the draft note (before approval)";
+    const historyBeforeApprove = await client.callTool({ name: "get_note_history", arguments: { id: noteId } });
+    assert(!historyBeforeApprove.isError, `get_note_history returned isError: ${JSON.stringify(historyBeforeApprove)}`);
+    assert(
+      historyBeforeApprove.structuredContent?.events?.some((e) => e.event_type === "note_created"),
+      "expected a note_created event in get_note_history",
+    );
+    ok(`get_note_history: ${historyBeforeApprove.structuredContent.events.length} event(s), most recent=${historyBeforeApprove.structuredContent.events[0].event_type}`);
+
+    // approve/reject are human-only CLI operations (not exposed as MCP tools -- AI proposes,
+    // only the human CLI approves), so drive this step through the real CLI binary against
+    // the same data dir the MCP server has open, mirroring how a human reviewer would
+    // approve a draft an agent created via MCP. --data-dir is init/mcp only (see CLAUDE.md /
+    // context.ts's resolveDataDir), so other commands are pointed at it via AGENTPRESS_HOME.
+    const cliEnv = { ...process.env, AGENTPRESS_HOME: dataDir };
+    step = "approve the draft note via the CLI (human review step)";
+    execFileSync(
+      process.execPath,
+      [cliEntry, "approve", noteId, "--actor", "human:smoke-reviewer", "--reason", "smoke test approval"],
+      { stdio: "pipe", env: cliEnv },
+    );
+    ok(`approved ${noteId} via CLI`);
+
+    step = "search_notes now finds the verified note (and reports a score)";
+    const foundSearch = await client.callTool({ name: "search_notes", arguments: { query: "スモークテスト" } });
+    assert(!foundSearch.isError, `search_notes returned isError: ${JSON.stringify(foundSearch)}`);
+    assert(foundSearch.structuredContent?.results?.some((r) => r.id === noteId), "expected the verified note in search results");
+    const foundResult = foundSearch.structuredContent.results.find((r) => r.id === noteId);
+    assert(
+      typeof foundResult.score === "number" || foundResult.score === null,
+      "score should be a number or null",
+    );
+    ok(`search_notes found the verified note: score=${foundResult.score}`);
+
+    step = "recommend_archive on the now-verified note";
+    const archiveRec = await client.callTool({
+      name: "recommend_archive",
+      arguments: { note_id: noteId, reason: "スモークテスト用ノートのため、確認後にarchiveしてよい" },
+    });
+    assert(!archiveRec.isError, `recommend_archive returned isError: ${JSON.stringify(archiveRec)}`);
+    const archiveProposalId = archiveRec.structuredContent?.proposal_id;
+    assert(typeof archiveProposalId === "string" && archiveProposalId.startsWith("proposal_"), `expected a proposal_ id, got ${archiveProposalId}`);
+    assert(archiveRec.structuredContent?.proposal_type === "archive_recommendation", "expected proposal_type:archive_recommendation");
+    assert(archiveRec.structuredContent?.status === "pending_review", "a freshly created recommendation should be pending_review");
+    ok(`recommend_archive: id=${archiveProposalId} status=${archiveRec.structuredContent.status}`);
+
+    step = "list_review_items surfaces the archive recommendation with its proposal_type";
+    const reviewItems = await client.callTool({ name: "list_review_items", arguments: { kind: "proposal" } });
+    assert(!reviewItems.isError, `list_review_items returned isError: ${JSON.stringify(reviewItems)}`);
+    const listedRec = reviewItems.structuredContent?.items?.find((i) => i.id === archiveProposalId);
+    assert(listedRec !== undefined, "expected the archive recommendation to appear in list_review_items");
+    assert(listedRec.proposal_type === "archive_recommendation", "expected proposal_type:archive_recommendation in list_review_items");
+    ok(`list_review_items: found ${archiveProposalId} with proposal_type=${listedRec.proposal_type}`);
+
+    step = "get_review_item on the archive recommendation";
+    const archiveDetail = await client.callTool({ name: "get_review_item", arguments: { id: archiveProposalId } });
+    assert(!archiveDetail.isError, `get_review_item returned isError: ${JSON.stringify(archiveDetail)}`);
+    assert(archiveDetail.structuredContent?.proposal_type === "archive_recommendation", "expected proposal_type:archive_recommendation in get_review_item");
+    ok(`get_review_item: proposal_type=${archiveDetail.structuredContent.proposal_type} reason="${archiveDetail.structuredContent.reason}"`);
+
+    step = "approve the archive recommendation via the CLI, then confirm the note is archived";
+    execFileSync(
+      process.execPath,
+      [cliEntry, "approve", archiveProposalId, "--actor", "human:smoke-reviewer2", "--reason", "confirmed obsolete"],
+      { stdio: "pipe", env: cliEnv },
+    );
+    const getArchivedNote = await client.callTool({ name: "get_note", arguments: { id: noteId } });
+    assert(!getArchivedNote.isError, `get_note on the archived note returned isError: ${JSON.stringify(getArchivedNote)}`);
+    assert(getArchivedNote.structuredContent?.status === "archived", `expected status:archived, got ${getArchivedNote.structuredContent?.status}`);
+    ok(`approved the archive recommendation via CLI: ${noteId} is now status=archived`);
+
+    step = "get_note_history on the archive proposal";
+    const proposalHistory = await client.callTool({ name: "get_note_history", arguments: { id: archiveProposalId, limit: 5 } });
+    assert(!proposalHistory.isError, `get_note_history returned isError: ${JSON.stringify(proposalHistory)}`);
+    assert(
+      proposalHistory.structuredContent?.events?.some((e) => e.event_type === "proposal_approved"),
+      "expected a proposal_approved event in get_note_history for the archive proposal",
+    );
+    ok(`get_note_history on ${archiveProposalId}: ${proposalHistory.structuredContent.events.length} event(s)`);
 
     console.log(`\n[smoke-mcp] PASSED (${passed} checks)`);
   } finally {

@@ -113,4 +113,25 @@ describe("search_notes tool", () => {
     expect(verified?.usage_warning).toBeUndefined();
     expect(archived?.usage_warning).toBe("This note is archived and no longer recommended as current guidance.");
   });
+
+  it("includes a numeric score for a 3+ char query (default search_engine: auto uses FTS5 in this environment)", () => {
+    const ctx = makeTestContext();
+    insertNote(ctx, { id: "note_1", title: "GA4連携ガイド", summary: "GA4のセットアップ手順です。" });
+
+    const body = structured<{ results: Array<{ id: string; score: number | null }> }>(
+      searchNotesTool(ctx, { query: "GA4連携ガイド" }),
+    );
+    expect(body.results).toHaveLength(1);
+    expect(typeof body.results[0].score).toBe("number");
+  });
+
+  it("returns score: null when search_engine is forced to like", () => {
+    const ctx = makeTestContext({ config: { search_engine: "like" } });
+    insertNote(ctx, { id: "note_1", title: "GA4連携ガイド", summary: "GA4のセットアップ手順です。" });
+
+    const body = structured<{ results: Array<{ id: string; score: number | null }> }>(
+      searchNotesTool(ctx, { query: "GA4連携ガイド" }),
+    );
+    expect(body.results[0].score).toBeNull();
+  });
 });

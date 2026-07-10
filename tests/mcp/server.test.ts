@@ -11,8 +11,10 @@ const EXPECTED_TOOL_NAMES = [
   "create_note_draft",
   "update_draft",
   "propose_note_update",
+  "recommend_archive",
   "list_review_items",
   "get_review_item",
+  "get_note_history",
 ];
 
 /** Connects a Client to a buildMcpServer(ctx) instance over an in-memory transport pair
@@ -27,7 +29,7 @@ async function connectedClient(ctx: ReturnType<typeof makeTestContext>) {
 }
 
 describe("buildMcpServer", () => {
-  it("registers exactly the 8 agent-facing tools from spec.md", async () => {
+  it("registers exactly the 10 agent-facing tools from spec.md", async () => {
     const ctx = makeTestContext();
     const { client } = await connectedClient(ctx);
 

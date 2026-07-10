@@ -49,8 +49,9 @@ export function renderPendingList(items: ReviewItem[]): string {
   lines.push(pc.bold(`${items.length} item(s), oldest first:`));
   for (const item of items) {
     const flags = [item.hasWarnings ? "⚠" : "", item.hasDuplicates ? "≈" : ""].filter(Boolean).join(" ");
+    const kindLabel = item.proposalType === "archive_recommendation" ? `${item.kind}:archive` : item.kind;
     lines.push(
-      `  ${item.id}  [${item.kind}/${item.status}]  scope=${item.scope ?? "-"}  ${item.title}${flags ? "  " + flags : ""}  (${item.createdAt})`,
+      `  ${item.id}  [${kindLabel}/${item.status}]  scope=${item.scope ?? "-"}  ${item.title}${flags ? "  " + flags : ""}  (${item.createdAt})`,
     );
   }
   return lines.join("\n");
@@ -86,12 +87,21 @@ export function renderNoteDetail(note: NoteWithDetail, policyWarnings: PolicyWar
 }
 
 export function renderProposalDetail(item: ReviewItemDetail): string {
+  const isArchiveRecommendation = item.proposalType === "archive_recommendation";
   const lines: string[] = [];
-  lines.push(`${pc.bold(item.id)}  status: ${item.status}`);
+  lines.push(
+    `${pc.bold(item.id)}  status: ${item.status}${isArchiveRecommendation ? pc.yellow("  [ARCHIVE RECOMMENDATION]") : ""}`,
+  );
   lines.push(`target note: ${item.targetNoteId ?? "-"}`);
   lines.push(`proposed_by: ${item.proposedBy ?? "-"}`);
   lines.push(`reason: ${item.reason ?? "-"}`);
-  lines.push(`changed_fields: ${item.changedFields?.join(", ") || "-"}`);
+  if (isArchiveRecommendation) {
+    lines.push(
+      "This is a recommendation to archive the target note (no content change). Approving it archives the note; approve/reject applies as usual.",
+    );
+  } else {
+    lines.push(`changed_fields: ${item.changedFields?.join(", ") || "-"}`);
+  }
   if (item.source && item.source.length > 0) lines.push(`source: ${JSON.stringify(item.source)}`);
   if (item.baseNoteVersion !== undefined) {
     lines.push(`base_note_version: ${item.baseNoteVersion}   current_note_version: ${item.currentNoteVersion}`);
@@ -151,9 +161,10 @@ export function renderSearchResult(result: SearchResult): string {
   return result.results
     .map((r) => {
       const stale = r.stale ? pc.yellow(" [stale]") : "";
+      const score = r.score !== null ? `  score=${r.score.toFixed(2)}` : "";
       return [
         `${pc.bold(r.id)}  ${r.title}${stale}`,
-        `  status=${r.status} confidence=${r.confidence} scope=${r.scope ?? "-"} matched=${r.matchedFields.join(",") || "-"}`,
+        `  status=${r.status} confidence=${r.confidence} scope=${r.scope ?? "-"} matched=${r.matchedFields.join(",") || "-"}${score}`,
         `  ${r.snippet}`,
         `  citation: ${renderCitation(r.citation)}`,
       ].join("\n");

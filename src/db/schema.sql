@@ -1,4 +1,4 @@
--- Reference DDL only. The source of truth is migrations.ts (001_init).
+-- Reference DDL only. The source of truth is migrations.ts (001_init, 002_fts5_search).
 -- Kept in sync manually; do not apply this file directly.
 
 CREATE TABLE notes (
@@ -117,3 +117,28 @@ CREATE TABLE schema_migrations (
   name TEXT NOT NULL,
   applied_at TEXT NOT NULL
 );
+
+-- 002_fts5_search: best-effort. Requires SQLite >= 3.34 built with FTS5 + the trigram
+-- tokenizer; if unsupported, migrations.ts's up() swallows the error and this table/its
+-- triggers are simply absent (search.ts falls back to (or, for search_engine: "fts5",
+-- errors clearly instead of silently falling back from) the LIKE engine -- see
+-- hasFts5TrigramSupport() / createSearchEngine() in src/core/search.ts).
+CREATE VIRTUAL TABLE notes_fts USING fts5(
+  search_text,
+  content='notes',
+  content_rowid='rowid',
+  tokenize='trigram'
+);
+
+CREATE TRIGGER notes_fts_ai AFTER INSERT ON notes BEGIN
+  INSERT INTO notes_fts(rowid, search_text) VALUES (new.rowid, new.search_text);
+END;
+
+CREATE TRIGGER notes_fts_ad AFTER DELETE ON notes BEGIN
+  INSERT INTO notes_fts(notes_fts, rowid, search_text) VALUES('delete', old.rowid, old.search_text);
+END;
+
+CREATE TRIGGER notes_fts_au AFTER UPDATE ON notes BEGIN
+  INSERT INTO notes_fts(notes_fts, rowid, search_text) VALUES('delete', old.rowid, old.search_text);
+  INSERT INTO notes_fts(rowid, search_text) VALUES (new.rowid, new.search_text);
+END;

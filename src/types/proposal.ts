@@ -39,6 +39,14 @@ export const ProposeUpdateInput = z.object({
 });
 export type ProposeUpdateInput = z.infer<typeof ProposeUpdateInput>;
 
+/** No proposed_* fields: this proposal type carries no content change, only a
+ *  recommendation (the `reason`) that a human archive the target note. */
+export const RecommendArchiveInput = z.object({
+  note_id: z.string().min(1),
+  reason: z.string().min(1),
+});
+export type RecommendArchiveInput = z.infer<typeof RecommendArchiveInput>;
+
 export interface CreateProposalResult {
   proposal: Proposal;
   policyWarnings: PolicyWarning[];
@@ -75,6 +83,8 @@ export interface ReviewItem {
   kind: "draft" | "proposal";
   status: string;
   noteStatus?: string;
+  /** kind:"proposal" only: "update" or "archive_recommendation" (see ProposalType). */
+  proposalType?: ProposalType;
   scope: string | null;
   createdBy: string;
   createdAt: string;
@@ -111,6 +121,8 @@ export interface ReviewItemDetail {
   status: string;
   /** kind:"note" only: the note's actual notes.status (e.g. "draft" when status is "pending_review"). */
   noteStatus?: string;
+  /** kind:"proposal" only: "update" or "archive_recommendation" (see ProposalType). */
+  proposalType?: ProposalType;
   usableAsContext: false;
   rejectionReason: string | null;
   draftReason?: string | null;

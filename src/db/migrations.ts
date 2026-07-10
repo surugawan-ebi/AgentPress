@@ -125,6 +125,53 @@ const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    id: 2,
+    name: "002_fts5_search",
+    up(db) {
+      // FTS5 with the trigram tokenizer needs SQLite >= 3.34 built with FTS5 enabled.
+      // Both are true for better-sqlite3's default prebuilt binaries (verified against the
+      // version this project pins), but a differently-built native module should not be
+      // able to break `agentpress init` entirely just because full-text search isn't
+      // available -- LIKE-based search still works either way. So this step is best-effort:
+      // wrapped in its own nested transaction (a SAVEPOINT, since we're already inside
+      // runMigrations' transaction) so a failure partway through cleanly undoes any partial
+      // DDL, and the outer try/catch swallows the error so the migration still "succeeds"
+      // with notes_fts simply absent. search.ts's hasFts5TrigramSupport() probes for the
+      // table's existence at search-engine construction time and falls back to (or, for
+      // `search_engine: "fts5"` explicitly, throws a clear startup error instead of) LIKE.
+      try {
+        const createFts5 = db.transaction(() => {
+          db.exec(`
+            CREATE VIRTUAL TABLE notes_fts USING fts5(
+              search_text,
+              content='notes',
+              content_rowid='rowid',
+              tokenize='trigram'
+            );
+
+            CREATE TRIGGER notes_fts_ai AFTER INSERT ON notes BEGIN
+              INSERT INTO notes_fts(rowid, search_text) VALUES (new.rowid, new.search_text);
+            END;
+
+            CREATE TRIGGER notes_fts_ad AFTER DELETE ON notes BEGIN
+              INSERT INTO notes_fts(notes_fts, rowid, search_text) VALUES('delete', old.rowid, old.search_text);
+            END;
+
+            CREATE TRIGGER notes_fts_au AFTER UPDATE ON notes BEGIN
+              INSERT INTO notes_fts(notes_fts, rowid, search_text) VALUES('delete', old.rowid, old.search_text);
+              INSERT INTO notes_fts(rowid, search_text) VALUES (new.rowid, new.search_text);
+            END;
+
+            INSERT INTO notes_fts(notes_fts) VALUES('rebuild');
+          `);
+        });
+        createFts5();
+      } catch {
+        // notes_fts stays absent; see comment above.
+      }
+    },
+  },
 ];
 
 /** Runs pending migrations in id order, each in its own transaction. */

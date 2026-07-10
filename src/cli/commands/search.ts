@@ -1,6 +1,6 @@
 import type { Command } from "commander";
 import { createContext, type AppContext } from "../../core/context.js";
-import { createLikeSearchEngine } from "../../core/search.js";
+import { createSearchEngine } from "../../core/search.js";
 import { handleError } from "../context.js";
 import { renderSearchResult } from "../render.js";
 
@@ -15,7 +15,7 @@ export function registerSearchCommand(program: Command): void {
       let ctx: AppContext | undefined;
       try {
         ctx = createContext({});
-        const engine = createLikeSearchEngine(ctx);
+        const engine = createSearchEngine(ctx);
         const result = engine.search({
           query,
           include_archived: opts.includeArchived,

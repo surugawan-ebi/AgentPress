@@ -56,7 +56,7 @@ const DESCRIPTION = `[contribution plane] verified noteへの更新案(proposal)
 対象はverifiedのnote限定。draftへの提案は作れず(update_draftを使う)、archivedはarchived_targetエラーになる。
 base_note_versionは必須で、get_note/search_notesのcitation.versionをそのまま渡すこと。現在のnote.versionと一致しない場合はversion_conflictエラーになり、提案は作られない(古いget_note結果を基にした提案を作成時点で検出するため)。version_conflictが出た場合はget_noteで最新を取得し、base_note_versionを更新して再提案すること。
 すべてのproposed_*フィールドはoptionalで、指定したフィールドだけが変更対象になる。全フィールド無変更(空diff)はempty_changeエラーになる。
-古い知識を非推奨にしたい場合も、archive専用ツールはないため、本文修正の提案としてこのツールを使うこと。idempotency_keyを指定すると、同一keyの再実行は新しい副作用を起こさず既存結果を返す。`;
+古くなった知識をarchiveすべきだと考える場合は、このツールではなくrecommend_archiveを使うこと。idempotency_keyを指定すると、同一keyの再実行は新しい副作用を起こさず既存結果を返す。`;
 
 export function registerProposeNoteUpdateTool(server: McpServer, ctx: AppContext): void {
   server.registerTool(

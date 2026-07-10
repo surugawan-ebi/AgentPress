@@ -35,9 +35,11 @@ AgentPress は「APIで記事を管理できるCMS」ではありません。中
 - ローカルで動く MCP サーバと CLI（SaaS化・ログイン・課金・Web UIはなし）
 - draft 作成 → レビュー → 承認 → verified 化 → 検索・引用、という一連のワークフロー
 - 既存verified noteへの更新提案（update proposal）と optimistic lock（`version` 不一致時は `needs_rebase`）
+- 古くなった知識のarchive提案（`recommend_archive`）。承認されるとnoteがarchivedになる
 - Markdown import/export（`data/notes/`）
-- scope・owner・reviewer・actor の最小モデルと変更履歴（history）
+- scope・owner・reviewer・actor の最小モデルと変更履歴（history、`get_note_history`による監査用サマリ取得つき）
 - verified-onlyのデフォルト検索、`stale`（レビュー期限切れ）の可視化
+- LIKE検索とFTS5(trigram)検索の切り替え（`search_engine`設定）。日本語クエリでもFTS5の恩恵を受けられる
 
 ## インストール
 
@@ -86,6 +88,24 @@ agentpress mcp [--actor <actor>] [--data-dir <dir>]
 
 データディレクトリの解決順は `--data-dir` > 環境変数 `AGENTPRESS_HOME` > カレントの `./.agentpress/` です。actorの解決順は `--actor` > 環境変数 `AGENTPRESS_ACTOR` > config の `default_actor` > OSユーザー名です。
 
+## 設定（`agentpress.config.yaml`）
+
+`agentpress init` が `<データディレクトリ>/agentpress.config.yaml` を生成します。検索エンジンは `search_engine` で切り替えられます。
+
+```yaml
+# auto: このSQLiteビルドがFTS5(trigram)対応ならFTS5、非対応ならLIKE。
+# like: 常にLIKE検索。
+# fts5: FTS5(trigram)を要求する。非対応環境では黙ってLIKEへフォールバックせず、
+#       起動時（`agentpress mcp`起動時、またはCLIコマンド実行時）に明確なエラーで落ちる。
+search_engine: auto
+```
+
+- `auto`（デフォルト）: ほとんどの環境ではFTS5(trigram)が使え、日本語クエリでも実用的にヒットします。3文字未満のクエリ語や、まれにFTS5側で構文エラーになった語はLIKE検索に自動フォールバックします
+- `like`: 常にLIKE部分一致検索にします
+- `fts5`: FTS5(trigram)を明示的に要求します。対応していない環境で使うと起動時にエラーになります（LIKEへの暗黙のフォールバックはしません）
+
+`search_notes` の各結果には `score`（FTS5マッチのみ数値、LIKEマッチは `null`）が付きます。`score` はそのクエリの中でのみ意味を持つ相対値で、`confidence`（知識自体の信頼度）とは無関係です。
+
 ## MCPクライアントからの接続方法
 
 stdio transportで起動するため、Claude Desktop や `.mcp.json` 形式で設定できるMCPクライアントから直接呼び出せます。
@@ -131,24 +151,26 @@ actor は MCP tool の入力からは受け取りません。stdio transport は
 2. **正式根拠として使ってよいのは `verified` のみ。** `draft` / `rejected` / review中の `proposal` は `list_review_items` / `get_review_item` でしか見えず、これらの内容を回答の根拠にしてはいけない（`get_review_item` のレスポンスは常に `usable_as_context: false`）。
 3. **`search_notes` が0件のとき**、レスポンスは `{results: [], no_results: true, query, searched_statuses, guidance, suggested_next_tools}` の形になる。外部知識や一般知識を組織の正式ナレッジであるかのように提示せず、確度の高い知識があれば `create_note_draft` で提案する。
 4. **`stale: true` の扱い。** `review_due_at` を過ぎた verified note は `stale: true` を付けて返る。正式根拠として使ってよいが、回答時に「要再確認」であることを明示すること。`strict_stale_filter: true` の設定時は検索結果からstale noteが除外される。
-5. **既存ノートは直接上書きしない。** 更新したい場合は `propose_note_update` で提案する。承認・却下・archiveはCLI限定（人間専用）。
+5. **既存ノートは直接上書きしない。** 更新したい場合は `propose_note_update` で提案する。古くなった知識をarchiveすべきだと判断した場合は `recommend_archive` で人間に提案する。承認・却下・archiveの実行そのものはCLI限定（人間専用）。
 
-## MCP tools 一覧（8 tools）
+## MCP tools 一覧（10 tools）
 
 | tool | plane | 説明 |
 |---|---|---|
 | `get_registry_overview` | verified | 接続直後に呼ぶ入口ツール。scope構成・件数・usage_policyを返す |
-| `search_notes` | verified | verified note を検索する（NFKC正規化+LIKE、`include_archived`可） |
+| `search_notes` | verified | verified note を検索する（NFKC正規化 + LIKE/FTS5、`include_archived`可、`score`つき） |
 | `get_note` | verified | note_idからverified/archivedノートの詳細を取得する。draft/rejectedはエラー |
 | `create_note_draft` | contribution | 新しい知識案(draft)を作成する。承認されるまで正式根拠にならない |
 | `update_draft` | contribution | 自分が作成したdraft/rejectedを編集する。rejectedを編集すると再提出(draft)になる |
 | `propose_note_update` | contribution | verified noteへの更新案(proposal)を作成する。`base_note_version`の不一致は`version_conflict` |
+| `recommend_archive` | contribution | verified noteをarchiveするよう人間に提案する。承認されるとnoteがarchivedになる |
 | `list_review_items` | review | draft/proposal横断のレビュー一覧（正式根拠としては使わない） |
 | `get_review_item` | review | note_/proposal_のIDから全文とレビュー状態を返す（`usable_as_context: false`固定） |
+| `get_note_history` | review | note_/proposal_のIDについて、監査用の変更履歴（snapshotなし）を返す |
 
-`approve_note` / `reject_review` / `archive_note` は MCP toolとして公開せず、CLI限定です（AIによる正式知識への直接書き込みを防ぐための設計上の境界）。
+`approve_note` / `reject_review` / `archive_note` は MCP toolとして公開せず、CLI限定です（AIによる正式知識への直接書き込みを防ぐための設計上の境界）。`recommend_archive` はあくまで提案で、archiveそのものは人間がCLIで承認して初めて実行されます。
 
-mutating tool（`create_note_draft` / `update_draft` / `propose_note_update`）は任意の `idempotency_key` を受け付け、同一keyでの再実行は新しい副作用を起こさず元の結果を返します。
+mutating tool（`create_note_draft` / `update_draft` / `propose_note_update` / `recommend_archive`）は任意の `idempotency_key` を受け付け、同一keyでの再実行は新しい副作用を起こさず元の結果を返します。
 
 ## CLIの使い方
 
@@ -175,7 +197,7 @@ agentpress import <path> [--verified] [--source <type>] [--commit <sha>]
 | エンティティ | 説明 |
 |---|---|
 | **Note** | 知識単位。`status: draft \| verified \| archived \| rejected`、`confidence: low \| medium \| high`、`scope`、`owner`、`version`、`review_due_at` などを持つ |
-| **Update Proposal** | 既存verified noteへの変更案。`status: pending_review \| approved \| rejected \| needs_rebase`、`base_note_version`、`diff`、`changed_fields` を持つ |
+| **Update Proposal** | 既存verified noteへの変更案。`proposal_type: update \| archive_recommendation`、`status: pending_review \| approved \| rejected \| needs_rebase`、`base_note_version`、`diff`、`changed_fields` を持つ。`archive_recommendation`は内容変更を伴わず、承認されると対象noteがarchivedになる |
 | **History Event** | 全ての変更履歴（`note_created` / `note_verified` / `proposal_approved` など）。actor・role・reason・timestampを記録し、監査の土台にする |
 | **Source / Tag / Relation** | note に紐づく出典・タグ・関連ノート |
 
@@ -191,7 +213,8 @@ maintainer   schema・import/export・policy・scope設定を管理する
 
 - AIが作った draft はいきなり `verified` にはなりません。人間が `agentpress approve` するまでは review 待ちです。
 - `propose_note_update` で作られた proposal は、承認時に `base_note_version` と現在の `note.version` が一致するかを検証します（optimistic lock）。不一致なら proposal は `needs_rebase` になり、AIは現行のverified noteを取得し直して再提案します。
-- 1つの proposal が承認されると、同じnoteに対する他の pending proposal は自動的に `needs_rebase` にカスケードします。
+- `recommend_archive` で作られた proposal（`proposal_type: archive_recommendation`）は、承認時に対象noteが依然 `verified` であることだけを検証します（内容を適用するのではなく、対象note自体をarchivedにするため）。
+- 1つの proposal が承認されると、同じnoteに対する他の pending proposal（type問わず）は自動的に `needs_rebase` にカスケードします。
 - `reviewer` は `created_by`（作成者）と同一actorにしないことが推奨されます。MVPでは警告（`reviewer_separation`）にとどめ、強制はしません。
 - 承認・却下・archiveは必ずhistoryに記録されます（`agentpress history <id>` で確認可能）。
 
@@ -208,10 +231,10 @@ Apache License 2.0 で公開しています（[LICENSE](./LICENSE)）。Issue・
 ## ロードマップ
 
 **Phase 1: OSS Local Governed MVP（本リポジトリの現状）**
-ローカルMCPサーバ、SQLite、Markdown import/export、8 MCP tools、CLIによるapprove/reject/archive/import/export、履歴管理、example vault。
+ローカルMCPサーバ、SQLite、Markdown import/export、10 MCP tools（`recommend_archive`・`get_note_history`を含む）、LIKE/FTS5(trigram)切り替え検索、CLIによるapprove/reject/archive/import/export、履歴管理、example vault。
 
 **Phase 2: Team Workflow Pack**
-scope別reviewerなどのpolicy設定強化、due date/stale検出の高度化、context pack、CLIでのreview queue改善、`recommend_archive` のMCP公開、`get_note_history` のMCP公開、FTS5(trigram)によるSearchEngine差し替え、source種別ごとの厳格な承認条件。
+scope別reviewerなどのpolicy設定強化、due date/stale検出の高度化、context pack、CLIでのreview queue改善、source種別ごとの厳格な承認条件。
 
 **Phase 3: Connectors and Governance**
 ベクトル検索、類似ノート検出、矛盾検出、古い知識の検出、citation強化、AI回答用のcontext packaging、Notion/Confluence/Google Docs/Slack/GitHub connector、OpenWiki生成docsのimport、MCP tool単位のpolicy、複数AIクライアント対応。
