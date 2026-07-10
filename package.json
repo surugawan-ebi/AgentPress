@@ -4,6 +4,14 @@
   "description": "A Git-style review queue for the knowledge your AI agents are allowed to cite. MCP server + CLI for approval-first agent knowledge management.",
   "type": "module",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/surugawan-ebi/AgentPress.git"
+  },
+  "homepage": "https://github.com/surugawan-ebi/AgentPress#readme",
+  "bugs": {
+    "url": "https://github.com/surugawan-ebi/AgentPress/issues"
+  },
   "keywords": [
     "mcp",
     "model-context-protocol",
