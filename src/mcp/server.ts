@@ -8,6 +8,7 @@ import { createSearchEngine } from "../core/search.js";
 import { registerGetRegistryOverviewTool } from "./tools/getRegistryOverview.js";
 import { registerSearchNotesTool } from "./tools/searchNotes.js";
 import { registerGetNoteTool } from "./tools/getNote.js";
+import { registerGetContextPackTool } from "./tools/getContextPack.js";
 import { registerCreateNoteDraftTool } from "./tools/createNoteDraft.js";
 import { registerUpdateDraftTool } from "./tools/updateDraft.js";
 import { registerProposeNoteUpdateTool } from "./tools/proposeNoteUpdate.js";
@@ -31,7 +32,7 @@ function readPackageVersion(): string {
 }
 
 /**
- * Assembles the McpServer and registers all 10 agent-facing tools (spec.md "Agent-facing MCP
+ * Assembles the McpServer and registers all 11 agent-facing tools (spec.md "Agent-facing MCP
  * Tools"), without connecting a transport. Kept separate from startMcpServer so tests can call
  * tool handlers directly without spawning a stdio process.
  */
@@ -47,6 +48,7 @@ export function buildMcpServer(ctx: AppContext): McpServer {
   registerGetRegistryOverviewTool(server, ctx);
   registerSearchNotesTool(server, ctx);
   registerGetNoteTool(server, ctx);
+  registerGetContextPackTool(server, ctx);
   registerCreateNoteDraftTool(server, ctx);
   registerUpdateDraftTool(server, ctx);
   registerProposeNoteUpdateTool(server, ctx);

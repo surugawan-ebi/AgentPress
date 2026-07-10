@@ -3,6 +3,7 @@ import { newId } from "./ids.js";
 import { AgentPressError, parseOrThrow } from "./errors.js";
 import { createHistoryService } from "./history.js";
 import { createPolicyService } from "./policy.js";
+import { computeConfigHash } from "../config/config.js";
 import { findPossibleDuplicates } from "./duplicates.js";
 import { buildSearchText } from "./searchText.js";
 import {
@@ -41,7 +42,7 @@ export interface NoteService {
 }
 
 export function createNoteService(ctx: AppContext): NoteService {
-  const { db, actor, role } = ctx;
+  const { db, actor, role, config } = ctx;
   const history = createHistoryService(ctx);
   const policy = createPolicyService(ctx);
 
@@ -258,6 +259,7 @@ export function createNoteService(ctx: AppContext): NoteService {
       }
 
       const now = new Date().toISOString();
+      const configHash = computeConfigHash(config);
       const runArchive = db.transaction(() => {
         const beforeSnapshot = buildNoteSnapshot(db, before);
         const updated: NoteRow = { ...before, status: "archived", archived_at: now, updated_at: now };
@@ -274,6 +276,7 @@ export function createNoteService(ctx: AppContext): NoteService {
           reason,
           beforeSnapshot,
           afterSnapshot: buildNoteSnapshot(db, updated),
+          metadata: { config_hash: configHash },
         });
         return rowToNote(updated);
       });

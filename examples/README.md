@@ -46,3 +46,18 @@ agentpress search "返金"
 ```
 
 `--verified` オプション付きで直接 import することもできますが（`agentpress import examples/support-vault --verified`）、その場合は `required_fields_for_verify`（デフォルトは `source` / `confidence` / `owner`）を満たさないノート（`pricing-faq.md`）は draft のまま残り、警告が表示されます。レビューフローそのものを確認したい場合は `--verified` を付けずに import するのがおすすめです。
+
+## context pack を試す
+
+このvaultのノートは全て `scope: support` です。`.agentpress/agentpress.config.yaml`（`agentpress init` が生成）に以下を追記すると、`get_context_pack` MCP toolでverified化した後のノートを一括取得できるデモができます。
+
+```yaml
+context_packs:
+  support-core:
+    description: "サポート対応の基本ナレッジ一式"
+    scopes: [support]
+    tags: []
+    note_ids: []
+```
+
+MCPクライアントから `get_context_pack({ name: "support-core" })` を呼ぶと、`scope: support` のverified noteがまとめて（デフォルトは本文なしのメタデータのみで）返ります。`get_registry_overview` の `context_packs[]` にも `support-core` とその時点の該当note件数が表示されます。

@@ -14,6 +14,10 @@ export const ERROR_CODES = [
   // A request with this idempotency_key is still mid-write (see mcp/idempotency.ts).
   // Distinct from version_conflict (an optimistic-lock mismatch on note content).
   "in_progress",
+  // An "enforce"-mode policy blocked this operation (scope_reviewers / reviewer_separation).
+  // Distinct from the "warn"-mode case, which is a policy_warning on an otherwise-successful
+  // response, not this error.
+  "policy_violation",
 ] as const;
 
 export type AgentPressErrorCode = (typeof ERROR_CODES)[number];

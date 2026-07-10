@@ -48,4 +48,20 @@ describe("get_registry_overview tool", () => {
     const body = structured<{ scopes: Array<{ scope: string }> }>(getRegistryOverviewTool(ctx, {}));
     expect(body.scopes.map((s) => s.scope)).toEqual(["a"]);
   });
+
+  it("includes context_packs with name/description/note_count", () => {
+    const ctx = makeTestContext({
+      config: {
+        context_packs: {
+          support_core: { description: "Core support knowledge", scopes: ["support"], tags: [], note_ids: [] },
+        },
+      },
+    });
+    insertNoteFixture(ctx, { id: "note_1", status: "verified", scope: "support" });
+
+    const body = structured<{ context_packs: Array<{ name: string; description: string; note_count: number }> }>(
+      getRegistryOverviewTool(ctx, {}),
+    );
+    expect(body.context_packs).toEqual([{ name: "support_core", description: "Core support knowledge", note_count: 1 }]);
+  });
 });

@@ -1,4 +1,6 @@
 import type { AppContext } from "./context.js";
+import type { AgentPressConfig } from "../config/config.js";
+import { AgentPressError } from "./errors.js";
 import type { Confidence } from "../types/common.js";
 import type { PolicyWarning } from "../types/policy.js";
 
@@ -32,12 +34,38 @@ export interface ApprovePolicyInput {
   sources: Array<{ type: string }>;
   /** Only meaningful for proposal targets: the note's review_due_at before this approval. */
   noteReviewDueAt?: string | null;
+  /** The target note's scope (scope_reviewers check). */
+  scope: string | null;
+}
+
+/** Result of assertApprovalAuthorized: whether this approval only went through because a
+ *  maintainer used their scope_reviewers break-glass bypass (see reviews.ts, which records
+ *  this on the resulting history event's metadata as scope_reviewer_bypass: true). */
+export interface AuthorizationResult {
+  scopeReviewerBypass: boolean;
 }
 
 export interface PolicyService {
   checkDraft(note: DraftPolicyInput): PolicyWarning[];
   checkApprove(target: ApprovePolicyInput): PolicyWarning[];
+  /**
+   * Enforces (throws policy_violation, does not just warn) reviewer_separation: "enforce"
+   * and scope_reviewers: "enforce". Call this before opening any write transaction, the same
+   * way the existing base_note_version pre-check works, so a rejection never leaves partial
+   * state. In "warn" mode (the default for both settings) this never throws -- the
+   * corresponding policy_warnings from checkApprove are the only signal.
+   */
+  assertApprovalAuthorized(input: { authorActor: string; scope: string | null }): AuthorizationResult;
   computeReviewDueAt(verifiedAt: string): string;
+}
+
+/** True when `actor` is NOT an authorized reviewer for `scope`: no scope, no reviewers
+ *  configured for that scope, or reviewers configured but actor isn't one of them. Shared
+ *  by checkApprove's not_scope_reviewer warning and assertApprovalAuthorized's enforcement
+ *  so the two conditions can never drift apart. */
+function violatesScopeReviewer(scope: string | null, actor: string, config: AgentPressConfig): boolean {
+  const reviewers = scope ? (config.scopes[scope]?.reviewers ?? []) : [];
+  return reviewers.length === 0 || !reviewers.includes(actor);
 }
 
 function weakSourceWarning(confidence: Confidence, sources: Array<{ type: string }>): PolicyWarning | null {
@@ -137,6 +165,14 @@ export function createPolicyService(ctx: AppContext): PolicyService {
         });
       }
 
+      if (violatesScopeReviewer(target.scope, ctx.actor, config)) {
+        warnings.push({
+          code: "not_scope_reviewer",
+          message: `${ctx.actor} is not a configured reviewer for scope ${target.scope ?? "(none)"}`,
+          suggested_action: "have a reviewer listed in scopes.<scope>.reviewers approve this change, or use a maintainer",
+        });
+      }
+
       const weakSource = weakSourceWarning(target.confidence, target.sources);
       if (weakSource) warnings.push(weakSource);
 
@@ -149,6 +185,40 @@ export function createPolicyService(ctx: AppContext): PolicyService {
       }
 
       return warnings;
+    },
+
+    assertApprovalAuthorized(input: { authorActor: string; scope: string | null }): AuthorizationResult {
+      if (config.reviewer_separation === "enforce" && input.authorActor === ctx.actor) {
+        throw new AgentPressError(
+          "policy_violation",
+          `${ctx.actor} is both the author and the approver; reviewer_separation is set to "enforce"`,
+          {
+            details: { author_actor: input.authorActor, actor: ctx.actor },
+            suggested_action: "have a different reviewer approve this change",
+          },
+        );
+      }
+
+      if (!violatesScopeReviewer(input.scope, ctx.actor, config)) {
+        return { scopeReviewerBypass: false };
+      }
+      if (config.scope_reviewers !== "enforce") {
+        return { scopeReviewerBypass: false };
+      }
+      if (ctx.role === "maintainer") {
+        // break-glass: not a listed reviewer for this scope, but a maintainer can still
+        // approve. Caller records this on the resulting history event's metadata.
+        return { scopeReviewerBypass: true };
+      }
+
+      throw new AgentPressError(
+        "policy_violation",
+        `${ctx.actor} is not a configured reviewer for scope ${input.scope ?? "(none)"}; scope_reviewers is set to "enforce"`,
+        {
+          details: { scope: input.scope, actor: ctx.actor, role: ctx.role },
+          suggested_action: "have a reviewer listed in scopes.<scope>.reviewers approve this, or have a maintainer approve it",
+        },
+      );
     },
 
     computeReviewDueAt(verifiedAt: string): string {

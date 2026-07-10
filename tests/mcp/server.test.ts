@@ -8,6 +8,7 @@ const EXPECTED_TOOL_NAMES = [
   "get_registry_overview",
   "search_notes",
   "get_note",
+  "get_context_pack",
   "create_note_draft",
   "update_draft",
   "propose_note_update",
@@ -29,7 +30,7 @@ async function connectedClient(ctx: ReturnType<typeof makeTestContext>) {
 }
 
 describe("buildMcpServer", () => {
-  it("registers exactly the 10 agent-facing tools from spec.md", async () => {
+  it("registers exactly the 11 agent-facing tools from spec.md", async () => {
     const ctx = makeTestContext();
     const { client } = await connectedClient(ctx);
 

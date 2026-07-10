@@ -34,15 +34,15 @@ agentpress/（このrepo直下）
     index.ts                  # ライブラリexport（core再export）
     cli/
       index.ts                # commander エントリ
-      commands/{init,mcp,list,search,show,approve,reject,archive,history,export,import}.ts
+      commands/{init,mcp,list,search,show,approve,reject,archive,history,export,import,audit}.ts
       render.ts               # テーブル/diff等の表示ヘルパ
     mcp/
       server.ts               # McpServer 組み立て + stdio 起動
-      tools/{getRegistryOverview,searchNotes,getNote,createNoteDraft,updateDraft,proposeNoteUpdate,recommendArchive,listReviewItems,getReviewItem,getNoteHistory}.ts
+      tools/{getRegistryOverview,searchNotes,getNote,getContextPack,createNoteDraft,updateDraft,proposeNoteUpdate,recommendArchive,listReviewItems,getReviewItem,getNoteHistory}.ts
       idempotency.ts          # mutating tool 共通ラッパ
     core/
       context.ts              # AppContext（db, config, actor, role）生成
-      notes.ts reviews.ts search.ts policy.ts history.ts registry.ts
+      notes.ts reviews.ts search.ts contextPacks.ts policy.ts history.ts registry.ts
       markdown.ts diff.ts duplicates.ts
       errors.ts               # AgentPressError + エラーコード
       ids.ts                  # newId('note'|'proposal'|'hist'|'src'|'batch')
@@ -149,7 +149,7 @@ CREATE TABLE history_events (
   reason TEXT,
   before_snapshot_json TEXT,
   after_snapshot_json TEXT,
-  metadata_json TEXT NOT NULL DEFAULT '{}',   -- 将来 policy version/hash 等
+  metadata_json TEXT NOT NULL DEFAULT '{}',   -- approve/reject/archive系は{config_hash}、maintainer bypass時は{config_hash, scope_reviewer_bypass:true}も
   created_at TEXT NOT NULL
 );
 CREATE INDEX idx_history_entity ON history_events(entity_type, entity_id);
@@ -226,14 +226,22 @@ default_search_status: verified
 strict_stale_filter: false
 default_review_interval_days: 90
 required_fields_for_verify: [source, confidence, owner]
-reviewer_separation: warn        # warn | enforce（MVPはwarnのみ実装）
+reviewer_separation: warn        # warn | enforce
+scope_reviewers: warn            # warn | enforce
 note_body_max_chars: 8000        # 超過で body_too_long 警告
 search_engine: auto              # auto | like | fts5
+max_body_chars: 8000             # get_context_pack の include_body:true 時の1件あたり上限
 scopes:
   support:
     description: ""
     owners: []
     reviewers: []
+context_packs:
+  support-core:
+    description: "Core support knowledge"
+    scopes: [support]
+    tags: []
+    note_ids: []
 ```
 
 `search_engine`:
@@ -241,6 +249,13 @@ scopes:
 - `auto`（デフォルト）: `hasFts5TrigramSupport(db)` が true なら `Fts5SearchEngine`、false なら `LikeSearchEngine`
 - `like`: 常に `LikeSearchEngine`
 - `fts5`: 常に `Fts5SearchEngine` を要求する。非対応環境では `createSearchEngine()` 呼び出し時点（MCPサーバはサーバ構築時、CLIはコマンドごとのプロセス起動時）に `invalid_input` エラーで落ち、`like` へ黙ってフォールバックしない
+
+`reviewer_separation` / `scope_reviewers`:
+
+- どちらも `warn`（デフォルト）と `enforce` を持つ。`warn` は該当する `policy_warnings`（`reviewer_separation` / `not_scope_reviewer`）を返すだけで承認は成立する。`enforce` は承認処理を実行せず `policy_violation` エラーで拒否する
+- `reviewer_separation: enforce` は承認者が対象の `created_by`/`proposed_by` と同一の場合に発火し、**role に関わらずbypassできない**
+- `scope_reviewers: enforce` は、承認者が対象noteの `scope` に対応する `scopes.<scope>.reviewers[]` に含まれない場合（scope未設定・reviewer未登録も同様）に発火するが、**`ctx.role === "maintainer"` はbreak-glassとして承認を継続できる**。継続した場合、`ReviewService` は承認成功時の history event の `metadata` に `scope_reviewer_bypass: true` を追加する
+- `computeConfigHash(config)`（`config.ts`、SHA-256・key順序に依存しない正規化JSON）を承認/却下/archive系の history event 全てに `config_hash` として記録する（`markdown.ts` の `--verified` import 経路も含む）
 
 - 解決順: CLI は `--actor` > env `AGENTPRESS_ACTOR` > config `default_actor` > OS user。role は `--role` > env `AGENTPRESS_ROLE` > `contributor`（approve/reject/archive コマンドは既定 `reviewer`）
 - MCP server は起動時に `--actor` / env を読み、**tool 入力からは一切受けない**
@@ -251,9 +266,9 @@ scopes:
 
 `AgentPressError extends Error`: `{ code, message, details?, retryable, suggested_action? }`。MCP tool ではこれを JSON で返し（`isError: true`）、CLI では人間向けに整形する。
 
-エラーコード: `not_found` `not_verified` `invalid_input` `empty_change` `version_conflict` `archived_target` `rejected_target` `not_draft_owner` `slug_conflict`(import時のみ) `io_error` `in_progress`(idempotency_key が使用中。version_conflict とは別系統)
+エラーコード: `not_found` `not_verified` `invalid_input` `empty_change` `version_conflict` `archived_target` `rejected_target` `not_draft_owner` `slug_conflict`(import時のみ) `io_error` `in_progress`(idempotency_key が使用中。version_conflict とは別系統) `policy_violation`(reviewer_separation/scope_reviewers の enforce モードで拒否)
 
-policy_warnings コード（`{code, message, suggested_action}`）: `missing_source` `weak_source_for_high_confidence` `body_too_long` `missing_headings` `summary_too_short`(< 20文字) `tags_too_sparse`(0個) `reviewer_separation` `stale_note`
+policy_warnings コード（`{code, message, suggested_action}`）: `missing_source` `weak_source_for_high_confidence` `body_too_long` `missing_headings` `summary_too_short`(< 20文字) `tags_too_sparse`(0個) `reviewer_separation` `stale_note` `not_scope_reviewer`(scope_reviewers が warn モード、または enforce+maintainer bypass のとき)
 
 ## コアサービス API
 
@@ -311,17 +326,36 @@ Fts5SearchEngine
 //   scoreはFTSでヒットした行だけ -bm25(notes_fts)（大きいほど良い）、LIKEのみの行はnull。
 //   並び順はscoreを持つ行を降順で先に、持たない行を既存のmatchedTermCount/updated_at順で後に
 
+// contextPacks.ts
+listPacks(): { name, description, noteCount }[]      // get_registry_overview の context_packs[] 用
+getPack(name, opts?: { includeBody?, limit?, cursor? }): ContextPackResult
+//   config.context_packs[name] が無ければ not_found（suggested_action に利用可能なpack名一覧）。
+//   selectorは (scopes OR AND tags全部含む、status='verified'のみ) ∪ note_ids(status問わず取得)。
+//   note_idsで解決した行のうち status='archived' は常に excluded(reason:"archived")、
+//   status!='verified'(draft/rejected) は excluded(reason:"not_verified")、
+//   存在しないidは excluded(reason:"not_found")。
+//   strict_stale_filter:true かつ stale な行は excluded(reason:"stale_filtered")、
+//   falseならcitation.stale:trueで含め、1件以上あればpack-level warningsに件数を積む。
+//   updated_at降順+id昇順でsort後、limit/cursorでページング(list_review_itemsと同じ簡易cursor)。
+//   include_body:trueのみ各noteにbody(config.max_body_charsで切り詰め)+bodyTruncatedを付与
+
 // policy.ts
 checkDraft(note): PolicyWarning[]              // 粒度/summary/tags/source品質
-checkApprove(target): PolicyWarning[]          // required_fields + reviewer_separation + weak_source
+checkApprove(target): PolicyWarning[]          // required_fields + reviewer_separation(warn) + not_scope_reviewer(warn) + weak_source
+assertApprovalAuthorized(input: { authorActor, scope }): { scopeReviewerBypass: boolean }
+//   reviewer_separation:enforce かつ authorActor===ctx.actor なら即 policy_violation（role問わずbypass不可）。
+//   scope_reviewers:enforce かつ ctx.actor がそのscopeのreviewers[]に無ければ、
+//   ctx.role==="maintainer" なら scopeReviewerBypass:true を返して継続、それ以外は policy_violation。
+//   どちらのenforceでもなければ常に { scopeReviewerBypass: false } を返す（例外を投げない）
 computeReviewDueAt(verifiedAt): string
 
 // registry.ts
-getRegistryOverview(scope?): RegistryOverview  // schema_version, server_version, strict_stale_filter, scopes[](verified_count/stale_count/top_tags/reviewers), usage_policy, recommended_first_steps
+getRegistryOverview(scope?): RegistryOverview  // schema_version, server_version, strict_stale_filter, scopes[](verified_count/stale_count/top_tags/reviewers), contextPacks[](name/description/noteCount), usage_policy, recommended_first_steps
 
 // history.ts
 record(event): void
 listByEntity(entityId): HistoryEvent[]
+queryEvents(query: { from?, to?, scope?, actor?, entityId? }): HistoryEvent[]  // agentpress audit 用の横断フィルタ
 
 // markdown.ts
 exportAll(outDir): ExportSummary               // <slug>--<id>.md, frontmatterにDB metadata
@@ -335,15 +369,15 @@ buildUnifiedDiff(before, after, label): string
 changedFields(input, note): string[]
 ```
 
-`approve` の処理順: 対象判定 → policy 検証（警告収集）→ reviewer separation 警告 → proposal なら `base_note_version === note.version` の事前チェック（安価な早期リターン用で、複数プロセス間の TOCTOU に対しては脆弱なため正しさの保証には使わない）。**不一致の場合は「当該 proposal を `needs_rebase` に更新 + history 記録」だけを独立トランザクションで commit してから `version_conflict` エラーを返す**（better-sqlite3 の transaction は throw で rollback されるため、状態更新とエラー送出を同一 tx に入れない）。事前チェックが一致した場合は 1 トランザクションで: `UPDATE notes ... WHERE id=@id AND version=@base_note_version AND status='verified'` を実行して `changes === 1` を検証する（これが実際の楽観ロック本体。0 件なら別プロセスがその間に version を進めたということなので、専用の例外を投げてこのトランザクションをロールバックし、事前チェック不一致時と同じ「needs_rebase 更新 + history を独立トランザクションで commit → `version_conflict`」経路にフォールバックする。フォールバック時は `note.version` を再取得してエラーメッセージに使う）。`changes === 1` なら同一トランザクション内で: note へ反映（`version+1` / `verified_at` / `review_due_at` 更新）→ `proposal.source` の各エントリを `note_sources` へ追記マージ（`type`+`url`+`path` が完全一致する既存行はスキップして重複を防ぐ。置き換えではなく追加）→ proposal を `approved` に → 同一 note の他 pending proposal を `needs_rebase` に + `proposal_needs_rebase` イベント → history 記録。draft note の承認も同様に `version+1` する（内容は変わらないが、spec.md の承認手順どおり単調増加を保つ）。note 系 history event の `before_snapshot_json`/`after_snapshot_json` は `noteRows.ts` の `buildNoteSnapshot(db, noteRow)`（`{note, tags, sources}`）に統一し、`note` 行だけでなく tags/sources も必ず含める。
+`approve` の処理順: 対象判定 → policy 検証（警告収集、`not_scope_reviewer`/`reviewer_separation` warn を含む）→ `policy.assertApprovalAuthorized({ authorActor, scope })` で enforce モードの認可を検証（拒否ならここで `policy_violation` を投げてトランザクションを一切開始しない。成立時は `scopeReviewerBypass` を受け取り、後段の history metadata に使う）→ proposal なら `base_note_version === note.version` の事前チェック（安価な早期リターン用で、複数プロセス間の TOCTOU に対しては脆弱なため正しさの保証には使わない）。**不一致の場合は「当該 proposal を `needs_rebase` に更新 + history 記録」だけを独立トランザクションで commit してから `version_conflict` エラーを返す**（better-sqlite3 の transaction は throw で rollback されるため、状態更新とエラー送出を同一 tx に入れない）。事前チェックが一致した場合は 1 トランザクションで: `UPDATE notes ... WHERE id=@id AND version=@base_note_version AND status='verified'` を実行して `changes === 1` を検証する（これが実際の楽観ロック本体。0 件なら別プロセスがその間に version を進めたということなので、専用の例外を投げてこのトランザクションをロールバックし、事前チェック不一致時と同じ「needs_rebase 更新 + history を独立トランザクションで commit → `version_conflict`」経路にフォールバックする。フォールバック時は `note.version` を再取得してエラーメッセージに使う）。`changes === 1` なら同一トランザクション内で: note へ反映（`version+1` / `verified_at` / `review_due_at` 更新）→ `proposal.source` の各エントリを `note_sources` へ追記マージ（`type`+`url`+`path` が完全一致する既存行はスキップして重複を防ぐ。置き換えではなく追加）→ proposal を `approved` に → 同一 note の他 pending proposal を `needs_rebase` に + `proposal_needs_rebase` イベント → history 記録。draft note の承認も同様に `version+1` する（内容は変わらないが、spec.md の承認手順どおり単調増加を保つ）。note 系 history event の `before_snapshot_json`/`after_snapshot_json` は `noteRows.ts` の `buildNoteSnapshot(db, noteRow)`（`{note, tags, sources}`）に統一し、`note` 行だけでなく tags/sources も必ず含める。承認・却下・archive 系の history event（`note_verified` / `note_updated`(承認由来) / `note_rejected` / `proposal_approved` / `proposal_rejected` / `note_archived`）は `metadata` に `computeConfigHash(config)` の結果を `config_hash` として必ず記録し、`assertApprovalAuthorized` が `scopeReviewerBypass: true` を返した承認ではさらに `scope_reviewer_bypass: true` も併記する（`needs_rebase` カスケード等の副次的な history event には付けない）。
 
 `proposal_type: "archive_recommendation"` の approve は上記と別経路（`approveArchiveRecommendation`）にする: 事前チェック/楽観ロックの対象は `version` ではなく `note.status`。対象 note を再取得し、`status === "archived"` なら `archived_target`、`status !== "verified"`（他のarchive経路で既に非verifiedになっていた場合）なら通常経路と同じ「needs_rebase 更新 + history を独立トランザクションで commit → `version_conflict`」にフォールバックする（`markArchiveRecommendationNeedsRebaseAndThrow`）。ロックが成立した場合は `UPDATE notes SET status='archived', archived_at=?, updated_at=? WHERE id=? AND status='verified'` で `changes === 1` を検証し（同一パターンの楽観ロック）、成立したら `note_archived` + `proposal_approved` の history を記録し、同一 note の他 pending proposal（`update`/`archive_recommendation` 問わず）を `needs_rebase` にカスケードする。内容フィールドの更新も `note_sources` への追記もない。
 
 ## MCP server 設計
 
-- `McpServer` に 10 tool を登録。tool ごとに zod の input schema **と outputSchema** を定義し、description には「draft/review item を正式根拠に使わない」「0件時の挙動」「stale の扱い」を明記する
+- `McpServer` に 11 tool を登録。tool ごとに zod の input schema **と outputSchema** を定義し、description には「draft/review item を正式根拠に使わない」「0件時の挙動」「stale の扱い」を明記する
 - レスポンスは `structuredContent`（構造化 JSON）を正とし、`content: [{type:"text", text: JSON.stringify(result)}]` を fallback として併記。エラーは `isError: true` + エラー JSON
-- mutating tool（create_note_draft / update_draft / propose_note_update / recommend_archive）は `idempotency.ts` のラッパを通す。予約は `(key, tool, actor)` 単位（同一keyでもactorが違えば別予約。MCPサーバはactorごとに別プロセスで起動するため）。フロー: (1) 短い独立トランザクションで予約行を INSERT して即 commit し、他プロセスからも `in_progress` が見えるようにする（既存行あり: `completed` なら保存済み結果を返す。`in_progress` かつ10分以内なら `in_progress` retryable エラー。10分より古い`in_progress`は放棄されたとみなし上書きして予約を取得する。`request_hash` 不一致なら `invalid_input`）→ (2) 予約 tx の外で mutation を実行（失敗時は `finally` で予約行を削除しリトライ可能にする）→ (3) 成功時に `result_json` を保存し `completed` に更新。`get_note_history` は読み取り専用のため idempotency ラッパを通さない
+- mutating tool（create_note_draft / update_draft / propose_note_update / recommend_archive）は `idempotency.ts` のラッパを通す。予約は `(key, tool, actor)` 単位（同一keyでもactorが違えば別予約。MCPサーバはactorごとに別プロセスで起動するため）。フロー: (1) 短い独立トランザクションで予約行を INSERT して即 commit し、他プロセスからも `in_progress` が見えるようにする（既存行あり: `completed` なら保存済み結果を返す。`in_progress` かつ10分以内なら `in_progress` retryable エラー。10分より古い`in_progress`は放棄されたとみなし上書きして予約を取得する。`request_hash` 不一致なら `invalid_input`）→ (2) 予約 tx の外で mutation を実行（失敗時は `finally` で予約行を削除しリトライ可能にする）→ (3) 成功時に `result_json` を保存し `completed` に更新。`get_note_history` / `get_context_pack` は読み取り専用のため idempotency ラッパを通さない
 - `propose_note_update` の入力に `base_note_version`（必須）を追加。get_note の citation.version をそのまま渡す想定
 - `buildMcpServer(ctx)` は tool 登録の前に `createSearchEngine(ctx)` を1回呼ぶ（結果は破棄。`search_notes` は呼び出しごとに自分でも構築する）。これにより `search_engine: "fts5"` を明示指定した環境が非対応の場合、サーバ構築時点（`agentpress mcp` 起動時）で即エラーになり、最初の検索まで気づかないという事態を防ぐ
 - search_notes の 0 件時は仕様どおり `no_results: true` / `guidance` / `suggested_next_tools` / `searched_statuses`（FTS→LIKEフォールバック適用後の最終結果に対して判定）
@@ -364,11 +398,13 @@ agentpress archive <note_id> --reason r [--actor a]
 agentpress history <id>
 agentpress export [--out data/notes]
 agentpress import <path> [--verified] [--source <type>] [--commit <sha>]
+agentpress audit [--from <iso>] [--to <iso>] [--scope <s>] [--actor <a>] [--entity <id>] [--format jsonl|csv] [--out <file>] [--with-snapshots]
 ```
 
 - `list --pending`: 冒頭に scope/kind 別件数サマリ → 古い順の一覧。各行に `⚠ warnings` / `≈ dup` フラグ
 - `show <proposal_id>`: 対象 note、reason、source、proposed_by、unified diff、changed_fields、needs_rebase なら復旧情報を表示
-- `import`: 完了時に「新規 draft n / proposal n / skip n」サマリ + scope ごとの小分けレビュー案内。`--verified` は import 直 verify（人間専用オプション、required_fields を検証）
+- `import`: 完了時に「新規 draft n / proposal n / skip n」サマリ + scope ごとの小分けレビュー案内。`--verified` は import 直 verify（人間専用オプション、required_fields を検証。`assertApprovalAuthorized`も通すため、enforceモードで拒否されれば draft のまま警告付きで継続する）
+- `audit`: `history.queryEvents()` を from/to/scope/actor/entity でフィルタし、`--format`（デフォルト jsonl）で出力する。jsonl は 1 行 1 event の JSON（`--with-snapshots` で before/after snapshot を追加）、csv はヘッダ行付きのフラット行（snapshot なし）。`--out` 未指定時は stdout（`console.log` 経由。CLI テストは `console.log` をキャプチャするため、`process.stdout.write` は使わない）。`--format csv` と `--with-snapshots` の同時指定は `invalid_input`
 - 出力は plain text（依存を増やさない。色は picocolors 程度なら可）
 
 ## Markdown import/export 詳細
@@ -389,8 +425,11 @@ frontmatter は spec.md の Knowledge Note 例に従う（id, slug, title, type,
 - unit: search FTS5(3文字以上のMATCH, 2文字以下のLIKEフォールバック, 混在クエリのunion, scoreの符号/null, auto probe, 明示fts5+非対応環境エラー, update/import経路でのnotes_fts同期)
 - service: notes(draft作成→update_draft→再提出) / reviews(draft approve, proposal approve, version_conflict, needs_rebase カスケード, reject, empty_change, 他人draft拒否)
 - service: reviews archive_recommendation(create→approve→noteがarchived+双方向needs_rebaseカスケード, reject, not_verified/archived_targetエラー, idempotency)
-- mcp: tool handler を直接呼ぶ（server 起動なし）。idempotency の重複実行、get_note の not_verified、search 0件、citation フィールド、recommend_archive、get_note_history
+- unit: contextPacks(scopes OR/tags AND/note_idsのpin, archived除外はpin時も適用, not_verified/not_found/stale_filtered除外, include_bodyのbodyキャップとlimitデフォルト差, cursor/truncated, listPacksのnoteCount)
+- service: policy/reviews 認可(scope_reviewers warn/enforce, reviewer_separationのenforceはmaintainerでもbypass不可, scope_reviewers enforceはmaintainerがbypass可でhistory metadataにscope_reviewer_bypass:trueを記録, 未設定scope/未登録reviewerの扱い, config_hashがapprove/reject/archive系eventに記録されること)
+- mcp: tool handler を直接呼ぶ（server 起動なし）。idempotency の重複実行、get_note の not_verified、search 0件、citation フィールド、recommend_archive、get_note_history、get_context_pack、get_registry_overviewのcontext_packs[]
 - cli: commander を programmatic に実行。テストごとに fresh な `Command` を factory（`buildProgram()`）で生成し、`exitOverride()` + `configureOutput()` で exit と出力を capture する。tmp dir で init→import→approve→search→export の統合フロー
+- cli: audit(jsonl/csvの既定・整形、from/to/scope/actor/entityフィルタ、--with-snapshots、--format csv --with-snapshotsのinvalid_input、--outでのファイル書き出し)
 - DB は各テストで tmp ファイル or `:memory:`（migration は共通）
 - ESM/NodeNext のため、相対 import には必ず `.js` 拡張子を付ける（`import { x } from "./notes.js"`）
 
@@ -402,9 +441,10 @@ frontmatter は spec.md の Knowledge Note 例に従う（id, slug, title, type,
 4. **Phase 3b**: MCP server + 8 tools + idempotency + tests（3a と並行可。src/mcp/ と tests/mcp* のみ触る）
 5. **Phase 4**: examples/support-vault + README + E2E 検証（実 CLI 実行 + MCP stdio 疎通）+ 完了条件チェック
 6. **Phase 2 機能追加**（初期MVP完了後）: migration 002（`notes_fts` + トリガー）+ `Fts5SearchEngine` + `search_engine`設定 + `recommend_archive`（reviews.ts / MCP tool / CLI表示）+ `get_note_history`（MCP tool）+ MCP 8→10 tools + docs/README更新 + version 0.2.0
+7. **Team Workflow Pack**（v0.2.0完了後）: `contextPacks.ts` + `get_context_pack`（MCP tool）+ `get_registry_overview`のcontext_packs[] + scope_reviewers/reviewer_separationのenforce実装（policy.ts/reviews.ts） + `policy_violation`エラーコード + `config_hash`のhistory記録 + `agentpress audit`（CLI） + `history.queryEvents` + MCP 10→11 tools + docs/README更新 + version 0.3.0
 
 Phase 1 で全依存を package.json に入れる（後続 phase は package.json を触らない）。
 
 ## 完了条件
 
-spec.md の Completion Criteria に従う: `npm install` / `npm run build` / `npm test` が通る、`agentpress init` で初期化できる、`agentpress mcp` で MCP サーバが起動する、10 tools が使える、CLI で検索・表示・承認・却下・archive ができる、Markdown export/import ができる、README が書かれている、example vault が同梱されている。
+spec.md の Completion Criteria に従う: `npm install` / `npm run build` / `npm test` が通る、`agentpress init` で初期化できる、`agentpress mcp` で MCP サーバが起動する、11 tools が使える、CLI で検索・表示・承認・却下・archive・audit ができる、Markdown export/importができる、README が書かれている、example vault が同梱されている。

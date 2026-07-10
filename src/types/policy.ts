@@ -11,6 +11,9 @@ export const POLICY_WARNING_CODES = [
   // required_fields_for_verify("owner") check, which has no existing code to
   // reuse (unlike "source" -> missing_source). See Phase 2 handoff notes.
   "missing_owner",
+  // scope_reviewers check (warn mode, or enforce mode + maintainer bypass): the approving
+  // actor isn't listed in scopes.<scope>.reviewers (or none are configured for this scope).
+  "not_scope_reviewer",
 ] as const;
 
 export type PolicyWarningCode = (typeof POLICY_WARNING_CODES)[number];

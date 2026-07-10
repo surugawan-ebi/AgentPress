@@ -1,6 +1,6 @@
 {
   "name": "agentpress",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A Git-style review queue for the knowledge your AI agents are allowed to cite. MCP server + CLI for approval-first agent knowledge management.",
   "type": "module",
   "license": "Apache-2.0",

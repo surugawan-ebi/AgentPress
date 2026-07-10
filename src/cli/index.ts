@@ -11,6 +11,7 @@ import { registerArchiveCommand } from "./commands/archive.js";
 import { registerHistoryCommand } from "./commands/history.js";
 import { registerExportCommand } from "./commands/export.js";
 import { registerImportCommand } from "./commands/import.js";
+import { registerAuditCommand } from "./commands/audit.js";
 
 /**
  * Builds a fresh Command tree. exitOverride() is enabled unconditionally here
@@ -38,6 +39,7 @@ export function buildProgram(): Command {
   registerHistoryCommand(program);
   registerExportCommand(program);
   registerImportCommand(program);
+  registerAuditCommand(program);
 
   return program;
 }

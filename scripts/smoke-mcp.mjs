@@ -25,6 +25,20 @@ const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "agentpress-smoke-"));
 let step = "startup";
 let passed = 0;
 
+// Config is loaded once at MCP server process startup (createContext() in mcp.ts), so it
+// must exist before the server is spawned below -- writing it later would have no effect
+// on the already-running process. Defines a context pack the get_context_pack step uses.
+fs.writeFileSync(
+  path.join(dataDir, "agentpress.config.yaml"),
+  `context_packs:
+  smoke_pack:
+    description: "Smoke test pack"
+    scopes: [smoke-test]
+    tags: []
+    note_ids: []
+`,
+);
+
 function ok(label) {
   passed += 1;
   console.log(`  ✓ ${label}`);
@@ -65,6 +79,7 @@ async function main() {
     const toolNames = toolList.tools.map((t) => t.name).sort();
     const expected = [
       "create_note_draft",
+      "get_context_pack",
       "get_note",
       "get_note_history",
       "get_registry_overview",
@@ -77,17 +92,21 @@ async function main() {
     ];
     assert(
       expected.every((name) => toolNames.includes(name)),
-      `expected all 10 tools, got: ${toolNames.join(", ")}`,
+      `expected all 11 tools, got: ${toolNames.join(", ")}`,
     );
-    assert(toolNames.length === 10, `expected exactly 10 tools, got ${toolNames.length}: ${toolNames.join(", ")}`);
-    ok(`tools/list returned all 10 expected tools: ${toolNames.join(", ")}`);
+    assert(toolNames.length === 11, `expected exactly 11 tools, got ${toolNames.length}: ${toolNames.join(", ")}`);
+    ok(`tools/list returned all 11 expected tools: ${toolNames.join(", ")}`);
 
     step = "get_registry_overview";
     const overview = await client.callTool({ name: "get_registry_overview", arguments: {} });
     assert(!overview.isError, `get_registry_overview returned isError: ${JSON.stringify(overview)}`);
     assert(overview.structuredContent?.schema_version === "1", "schema_version should be '1'");
     assert(Array.isArray(overview.structuredContent?.recommended_first_steps), "recommended_first_steps should be an array");
-    ok(`get_registry_overview: schema_version=${overview.structuredContent.schema_version} server_version=${overview.structuredContent.server_version} scopes=${overview.structuredContent.scopes.length}`);
+    assert(
+      overview.structuredContent?.context_packs?.some((p) => p.name === "smoke_pack"),
+      "expected the config-defined smoke_pack in context_packs",
+    );
+    ok(`get_registry_overview: schema_version=${overview.structuredContent.schema_version} server_version=${overview.structuredContent.server_version} scopes=${overview.structuredContent.scopes.length} context_packs=${overview.structuredContent.context_packs.length}`);
 
     step = "search_notes (0 results)";
     const emptySearch = await client.callTool({ name: "search_notes", arguments: { query: "存在しないキーワード" } });
@@ -106,6 +125,7 @@ async function main() {
         tags: ["smoke-test"],
         source: [{ type: "manual", title: "smoke-mcp.mjs" }],
         confidence: "medium",
+        scope: "smoke-test",
       },
     });
     assert(!created.isError, `create_note_draft returned isError: ${JSON.stringify(created)}`);
@@ -166,6 +186,23 @@ async function main() {
       "score should be a number or null",
     );
     ok(`search_notes found the verified note: score=${foundResult.score}`);
+
+    step = "get_context_pack returns the verified note via its scope";
+    const pack = await client.callTool({ name: "get_context_pack", arguments: { name: "smoke_pack" } });
+    assert(!pack.isError, `get_context_pack returned isError: ${JSON.stringify(pack)}`);
+    assert(pack.structuredContent?.name === "smoke_pack", "expected name:smoke_pack echoed back");
+    assert(pack.structuredContent?.notes?.some((n) => n.id === noteId), "expected the verified note in the pack");
+    const packedNote = pack.structuredContent.notes.find((n) => n.id === noteId);
+    assert(packedNote.body === undefined, "body should be omitted by default (include_body not set)");
+    ok(`get_context_pack: ${pack.structuredContent.notes.length} note(s), found ${noteId}`);
+
+    step = "get_context_pack with an unknown pack name errors not_found";
+    const missingPack = await client.callTool({ name: "get_context_pack", arguments: { name: "does_not_exist" } });
+    assert(missingPack.isError === true, "expected isError:true for an unknown pack name");
+    const missingPackError = JSON.parse(missingPack.content[0].text);
+    assert(missingPackError.code === "not_found", `expected not_found, got ${missingPackError.code}`);
+    assert(missingPackError.suggested_action?.includes("smoke_pack"), "expected available pack names in suggested_action");
+    ok(`get_context_pack on an unknown name correctly errors: code=${missingPackError.code}`);
 
     step = "recommend_archive on the now-verified note";
     const archiveRec = await client.callTool({

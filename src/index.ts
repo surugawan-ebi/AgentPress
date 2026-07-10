@@ -10,6 +10,7 @@ export * from "./core/searchText.js";
 export * from "./core/diff.js";
 export * from "./core/reviews.js";
 export * from "./core/search.js";
+export * from "./core/contextPacks.js";
 export * from "./core/registry.js";
 export * from "./core/markdown.js";
 export * from "./core/citation.js";

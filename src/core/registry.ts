@@ -2,15 +2,17 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AppContext } from "./context.js";
+import { createContextPackService } from "./contextPacks.js";
 
 const SCHEMA_VERSION = "1";
 const TOP_TAGS_LIMIT = 5;
 
 // Fixed MVP copy, matching spec.md's get_registry_overview example verbatim.
 const USAGE_POLICY =
-  "verified のみ正式根拠として使う。stale: true のnoteは要再確認として扱い、回答時にその旨を明示する。関連するverified noteが見つからない場合はcreate_note_draftで新規知識案を提案する。古くなった/もう使うべきでないverified noteを見つけた場合は、recommend_archiveで人間にarchiveを提案する(内容修正の提案ではなくこちらを使う)。";
+  "verified のみ正式根拠として使う。stale: true のnoteは要再確認として扱い、回答時にその旨を明示する。関連するverified noteが見つからない場合はcreate_note_draftで新規知識案を提案する。古くなった/もう使うべきでないverified noteを見つけた場合は、recommend_archiveで人間にarchiveを提案する(内容修正の提案ではなくこちらを使う)。context_packsに使いたい用途に近いpackがあれば、get_context_packで厳選済みのnote集合を一括取得できる。";
 const RECOMMENDED_FIRST_STEPS = [
   "get_registry_overview でscope構成とusage_policyを把握する",
+  "context_packsに関連するpackがあればget_context_packで一括取得する",
   "search_notes で関連知識を検索する",
   "見つからなければcreate_note_draftで提案する",
   "古い知識を見つけたらrecommend_archiveでarchiveを提案する",
@@ -26,11 +28,18 @@ export interface RegistryScopeOverview {
   reviewers: string[];
 }
 
+export interface RegistryContextPackOverview {
+  name: string;
+  description: string;
+  noteCount: number;
+}
+
 export interface RegistryOverview {
   schemaVersion: string;
   serverVersion: string;
   strictStaleFilter: boolean;
   scopes: RegistryScopeOverview[];
+  contextPacks: RegistryContextPackOverview[];
   usagePolicy: string;
   recommendedFirstSteps: string[];
 }
@@ -94,11 +103,16 @@ export function getRegistryOverview(ctx: AppContext, scope?: string | null): Reg
     };
   });
 
+  const contextPacks = createContextPackService(ctx)
+    .listPacks()
+    .map((p) => ({ name: p.name, description: p.description, noteCount: p.noteCount }));
+
   return {
     schemaVersion: SCHEMA_VERSION,
     serverVersion: readServerVersion(),
     strictStaleFilter: config.strict_stale_filter,
     scopes,
+    contextPacks,
     usagePolicy: USAGE_POLICY,
     recommendedFirstSteps: RECOMMENDED_FIRST_STEPS,
   };

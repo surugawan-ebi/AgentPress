@@ -296,6 +296,28 @@ describe("importPath", () => {
     ).toBe(true);
   });
 
+  it("with --verified and reviewer_separation:enforce, falls back to draft (does not abort the batch) since the importer is the author", () => {
+    const ctx = makeTestContext({ actor: "human:reviewer", config: { reviewer_separation: "enforce" } });
+    const dir = tmpDir();
+    writeMd(
+      dir,
+      "enforce-self.md",
+      {
+        title: "enforceモードの自己承認ノート",
+        summary: "reviewer_separation enforce下でimport --verifiedされる要約文です。",
+        owner: "cs-team",
+        confidence: "medium",
+        source: [{ type: "manual", title: "seed" }],
+      },
+      "# 概要\n本文",
+    );
+
+    const summary = importPath(ctx, dir, { verified: true });
+    const created = getNoteRow(ctx.db, summary.createdIds[0]);
+    expect(created?.status).toBe("draft");
+    expect(summary.warnings.some((w) => w.message.includes("could not verify"))).toBe(true);
+  });
+
   it("includes tags and sources in the note_updated history snapshot for a draft re-import (not just the note row)", () => {
     const ctx = makeTestContext({ actor: "agent:codex" });
     const notes = createNoteService(ctx);

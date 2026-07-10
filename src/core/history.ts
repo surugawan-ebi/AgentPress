@@ -34,9 +34,22 @@ function rowToEvent(row: HistoryRow): HistoryEvent {
   };
 }
 
+export interface HistoryEventQuery {
+  /** Inclusive ISO 8601 lower bound on created_at. */
+  from?: string;
+  /** Inclusive ISO 8601 upper bound on created_at. */
+  to?: string;
+  scope?: string;
+  actor?: string;
+  entityId?: string;
+}
+
 export interface HistoryService {
   record(input: RecordEventInput): HistoryEvent;
   listByEntity(entityId: string): HistoryEvent[];
+  /** Cross-entity query for `agentpress audit`: filters by any combination of
+   *  from/to/scope/actor/entityId, oldest first (same tie-break as listByEntity). */
+  queryEvents(query: HistoryEventQuery): HistoryEvent[];
 }
 
 export function createHistoryService(ctx: AppContext): HistoryService {
@@ -75,6 +88,36 @@ export function createHistoryService(ctx: AppContext): HistoryService {
         // order) to keep same-tick events in the order they were recorded.
         .prepare("SELECT * FROM history_events WHERE entity_id = ? ORDER BY created_at ASC, rowid ASC")
         .all(entityId) as HistoryRow[];
+      return rows.map(rowToEvent);
+    },
+
+    queryEvents(query: HistoryEventQuery): HistoryEvent[] {
+      const clauses: string[] = [];
+      const params: Record<string, unknown> = {};
+      if (query.from) {
+        clauses.push("created_at >= @from");
+        params.from = query.from;
+      }
+      if (query.to) {
+        clauses.push("created_at <= @to");
+        params.to = query.to;
+      }
+      if (query.scope) {
+        clauses.push("scope = @scope");
+        params.scope = query.scope;
+      }
+      if (query.actor) {
+        clauses.push("actor = @actor");
+        params.actor = query.actor;
+      }
+      if (query.entityId) {
+        clauses.push("entity_id = @entityId");
+        params.entityId = query.entityId;
+      }
+      const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+      const rows = db
+        .prepare(`SELECT * FROM history_events ${where} ORDER BY created_at ASC, rowid ASC`)
+        .all(params) as HistoryRow[];
       return rows.map(rowToEvent);
     },
   };

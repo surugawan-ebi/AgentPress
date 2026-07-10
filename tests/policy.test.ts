@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { createPolicyService, computeReviewDueAt } from "../src/core/policy.js";
+import { AgentPressError } from "../src/core/errors.js";
 import { makeTestContext } from "./helpers.js";
 
 const goodBody = "# 概要\n本文です。\n\n# 正本回答\nこれが正本回答です。";
@@ -107,10 +108,16 @@ describe("checkDraft", () => {
 });
 
 describe("checkApprove", () => {
-  it("returns no warnings for a well-formed draft note approval", () => {
-    const policy = createPolicyService(makeTestContext({ actor: "reviewer:human" }));
+  it("returns no warnings for a well-formed draft note approval by a configured scope reviewer", () => {
+    const policy = createPolicyService(
+      makeTestContext({
+        actor: "reviewer:human",
+        config: { scopes: { support: { description: "", owners: [], reviewers: ["reviewer:human"] } } },
+      }),
+    );
     const warnings = policy.checkApprove({
       kind: "note",
+      scope: "support",
       authorActor: "agent:codex",
       confidence: "medium",
       owner: "support-team",
@@ -123,6 +130,7 @@ describe("checkApprove", () => {
     const policy = createPolicyService(makeTestContext({ actor: "reviewer:human" }));
     const warnings = policy.checkApprove({
       kind: "note",
+      scope: null,
       authorActor: "agent:codex",
       confidence: "medium",
       owner: "support-team",
@@ -135,6 +143,7 @@ describe("checkApprove", () => {
     const policy = createPolicyService(makeTestContext({ actor: "reviewer:human" }));
     const warnings = policy.checkApprove({
       kind: "note",
+      scope: null,
       authorActor: "agent:codex",
       confidence: "medium",
       owner: null,
@@ -149,6 +158,7 @@ describe("checkApprove", () => {
     );
     const warnings = policy.checkApprove({
       kind: "note",
+      scope: null,
       authorActor: "agent:codex",
       confidence: "medium",
       owner: null,
@@ -162,6 +172,7 @@ describe("checkApprove", () => {
     const policy = createPolicyService(makeTestContext({ actor: "agent:codex" }));
     const warnings = policy.checkApprove({
       kind: "note",
+      scope: null,
       authorActor: "agent:codex",
       confidence: "medium",
       owner: "support-team",
@@ -174,6 +185,7 @@ describe("checkApprove", () => {
     const policy = createPolicyService(makeTestContext({ actor: "reviewer:human" }));
     const warnings = policy.checkApprove({
       kind: "note",
+      scope: null,
       authorActor: "agent:codex",
       confidence: "medium",
       owner: "support-team",
@@ -186,6 +198,7 @@ describe("checkApprove", () => {
     const policy = createPolicyService(makeTestContext({ actor: "reviewer:human" }));
     const warnings = policy.checkApprove({
       kind: "note",
+      scope: null,
       authorActor: "agent:codex",
       confidence: "high",
       owner: "support-team",
@@ -199,6 +212,7 @@ describe("checkApprove", () => {
     const past = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     const warnings = policy.checkApprove({
       kind: "proposal",
+      scope: null,
       authorActor: "agent:codex",
       confidence: "medium",
       owner: "support-team",
@@ -213,6 +227,7 @@ describe("checkApprove", () => {
     const future = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
     const warnings = policy.checkApprove({
       kind: "proposal",
+      scope: null,
       authorActor: "agent:codex",
       confidence: "medium",
       owner: "support-team",
@@ -226,12 +241,155 @@ describe("checkApprove", () => {
     const policy = createPolicyService(makeTestContext({ actor: "reviewer:human" }));
     const warnings = policy.checkApprove({
       kind: "note",
+      scope: null,
       authorActor: "agent:codex",
       confidence: "medium",
       owner: "support-team",
       sources: [{ type: "url" }],
     });
     expect(codes(warnings)).not.toContain("stale_note");
+  });
+
+  it("flags not_scope_reviewer when the actor isn't listed as a reviewer for the target scope", () => {
+    const policy = createPolicyService(
+      makeTestContext({
+        actor: "reviewer:human",
+        config: { scopes: { support: { description: "", owners: [], reviewers: ["someone-else"] } } },
+      }),
+    );
+    const warnings = policy.checkApprove({
+      kind: "note",
+      scope: "support",
+      authorActor: "agent:codex",
+      confidence: "medium",
+      owner: "support-team",
+      sources: [{ type: "url" }],
+    });
+    expect(codes(warnings)).toContain("not_scope_reviewer");
+  });
+
+  it("does not flag not_scope_reviewer when the actor is listed as a reviewer for the target scope", () => {
+    const policy = createPolicyService(
+      makeTestContext({
+        actor: "reviewer:human",
+        config: { scopes: { support: { description: "", owners: [], reviewers: ["reviewer:human"] } } },
+      }),
+    );
+    const warnings = policy.checkApprove({
+      kind: "note",
+      scope: "support",
+      authorActor: "agent:codex",
+      confidence: "medium",
+      owner: "support-team",
+      sources: [{ type: "url" }],
+    });
+    expect(codes(warnings)).not.toContain("not_scope_reviewer");
+  });
+
+  it("flags not_scope_reviewer for a scope with no configured reviewers", () => {
+    const policy = createPolicyService(
+      makeTestContext({
+        actor: "reviewer:human",
+        config: { scopes: { support: { description: "", owners: [], reviewers: [] } } },
+      }),
+    );
+    const warnings = policy.checkApprove({
+      kind: "note",
+      scope: "support",
+      authorActor: "agent:codex",
+      confidence: "medium",
+      owner: "support-team",
+      sources: [{ type: "url" }],
+    });
+    expect(codes(warnings)).toContain("not_scope_reviewer");
+  });
+});
+
+describe("assertApprovalAuthorized", () => {
+  it("in the default warn mode, never throws regardless of scope reviewer mismatch or reviewer_separation", () => {
+    const policy = createPolicyService(
+      makeTestContext({
+        actor: "agent:codex", // same as authorActor below
+        config: { scopes: { support: { description: "", owners: [], reviewers: ["someone-else"] } } },
+      }),
+    );
+    const result = policy.assertApprovalAuthorized({ authorActor: "agent:codex", scope: "support" });
+    expect(result).toEqual({ scopeReviewerBypass: false });
+  });
+
+  it("scope_reviewers:enforce rejects a non-reviewer, non-maintainer actor with policy_violation", () => {
+    const policy = createPolicyService(
+      makeTestContext({
+        actor: "reviewer:human",
+        role: "reviewer",
+        config: { scope_reviewers: "enforce", scopes: { support: { description: "", owners: [], reviewers: ["someone-else"] } } },
+      }),
+    );
+    expect(() => policy.assertApprovalAuthorized({ authorActor: "agent:codex", scope: "support" })).toThrow(AgentPressError);
+    try {
+      policy.assertApprovalAuthorized({ authorActor: "agent:codex", scope: "support" });
+      expect.unreachable();
+    } catch (err) {
+      expect((err as AgentPressError).code).toBe("policy_violation");
+    }
+  });
+
+  it("scope_reviewers:enforce allows an actor who is a configured reviewer for that scope", () => {
+    const policy = createPolicyService(
+      makeTestContext({
+        actor: "reviewer:human",
+        role: "reviewer",
+        config: { scope_reviewers: "enforce", scopes: { support: { description: "", owners: [], reviewers: ["reviewer:human"] } } },
+      }),
+    );
+    const result = policy.assertApprovalAuthorized({ authorActor: "agent:codex", scope: "support" });
+    expect(result).toEqual({ scopeReviewerBypass: false });
+  });
+
+  it("scope_reviewers:enforce lets a maintainer through as a break-glass bypass, reporting scopeReviewerBypass:true", () => {
+    const policy = createPolicyService(
+      makeTestContext({
+        actor: "maintainer:alice",
+        role: "maintainer",
+        config: { scope_reviewers: "enforce", scopes: { support: { description: "", owners: [], reviewers: ["someone-else"] } } },
+      }),
+    );
+    const result = policy.assertApprovalAuthorized({ authorActor: "agent:codex", scope: "support" });
+    expect(result).toEqual({ scopeReviewerBypass: true });
+  });
+
+  it("scope_reviewers:enforce rejects a non-maintainer for a scope with no reviewers configured at all", () => {
+    const policy = createPolicyService(
+      makeTestContext({ actor: "reviewer:human", role: "reviewer", config: { scope_reviewers: "enforce" } }),
+    );
+    expect(() => policy.assertApprovalAuthorized({ authorActor: "agent:codex", scope: "unconfigured-scope" })).toThrow(
+      AgentPressError,
+    );
+  });
+
+  it("scope_reviewers:enforce rejects a non-maintainer for a note with no scope at all", () => {
+    const policy = createPolicyService(makeTestContext({ actor: "reviewer:human", role: "reviewer", config: { scope_reviewers: "enforce" } }));
+    expect(() => policy.assertApprovalAuthorized({ authorActor: "agent:codex", scope: null })).toThrow(AgentPressError);
+  });
+
+  it("reviewer_separation:enforce rejects the author approving their own change, even as a maintainer (no bypass)", () => {
+    const policy = createPolicyService(
+      makeTestContext({ actor: "agent:codex", role: "maintainer", config: { reviewer_separation: "enforce" } }),
+    );
+    expect(() => policy.assertApprovalAuthorized({ authorActor: "agent:codex", scope: null })).toThrow(AgentPressError);
+    try {
+      policy.assertApprovalAuthorized({ authorActor: "agent:codex", scope: null });
+      expect.unreachable();
+    } catch (err) {
+      expect((err as AgentPressError).code).toBe("policy_violation");
+    }
+  });
+
+  it("reviewer_separation:enforce does not reject a different approver", () => {
+    const policy = createPolicyService(
+      makeTestContext({ actor: "reviewer:human", role: "reviewer", config: { reviewer_separation: "enforce" } }),
+    );
+    expect(() => policy.assertApprovalAuthorized({ authorActor: "agent:codex", scope: null })).not.toThrow();
   });
 });
 

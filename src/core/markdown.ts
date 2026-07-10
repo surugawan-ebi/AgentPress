@@ -9,6 +9,8 @@ import { createReviewService } from "./reviews.js";
 import { changedFields } from "./diff.js";
 import { buildSearchText } from "./searchText.js";
 import { findPossibleDuplicates } from "./duplicates.js";
+import { AgentPressError } from "./errors.js";
+import { computeConfigHash } from "../config/config.js";
 import {
   getNoteRow,
   getTags,
@@ -277,9 +279,25 @@ export function importPath(ctx: AppContext, inputPath: string, opts: ImportOptio
       confidence: note.confidence as Confidence,
       owner: note.owner,
       sources,
+      scope: note.scope,
     });
 
+    // Same enforce-mode authorization as a human `agentpress approve` would apply. Unlike
+    // that path, a rejection here doesn't abort the whole import -- it's downgraded to the
+    // same "created as draft, could not verify" outcome as a missing required field, so one
+    // note's policy violation doesn't stop the rest of the batch.
+    let scopeReviewerBypass = false;
+    try {
+      scopeReviewerBypass = policy.assertApprovalAuthorized({ authorActor: note.created_by, scope: note.scope }).scopeReviewerBypass;
+    } catch (err) {
+      if (err instanceof AgentPressError) {
+        return { verified: false, reason: err.message };
+      }
+      throw err;
+    }
+
     const now = new Date().toISOString();
+    const configHash = computeConfigHash(config);
     const runVerify = db.transaction(() => {
       const beforeSnapshot = buildNoteSnapshot(db, note);
       const reviewDueAt = policy.computeReviewDueAt(now);
@@ -305,6 +323,7 @@ export function importPath(ctx: AppContext, inputPath: string, opts: ImportOptio
         reason: "verified on import (--verified)",
         beforeSnapshot,
         afterSnapshot: buildNoteSnapshot(db, updated),
+        metadata: scopeReviewerBypass ? { config_hash: configHash, scope_reviewer_bypass: true } : { config_hash: configHash },
       });
     });
     runVerify();

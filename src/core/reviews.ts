@@ -3,6 +3,7 @@ import { newId } from "./ids.js";
 import { AgentPressError, parseOrThrow } from "./errors.js";
 import { createHistoryService } from "./history.js";
 import { createPolicyService } from "./policy.js";
+import { computeConfigHash } from "../config/config.js";
 import { buildUnifiedDiff, changedFields } from "./diff.js";
 import { buildSearchText } from "./searchText.js";
 import {
@@ -115,9 +116,16 @@ export interface ReviewService {
 }
 
 export function createReviewService(ctx: AppContext): ReviewService {
-  const { db, actor, role } = ctx;
+  const { db, actor, role, config } = ctx;
   const history = createHistoryService(ctx);
   const policy = createPolicyService(ctx);
+
+  /** {config_hash} or {config_hash, scope_reviewer_bypass:true}, for approve/reject/archive
+   *  history event metadata (see wall-discussion.md #15). */
+  function decisionMetadata(scopeReviewerBypass: boolean): Record<string, unknown> {
+    const configHash = computeConfigHash(config);
+    return scopeReviewerBypass ? { config_hash: configHash, scope_reviewer_bypass: true } : { config_hash: configHash };
+  }
 
   function requireNoteRow(id: string): NoteRow {
     const row = getNoteRow(db, id);
@@ -565,9 +573,12 @@ export function createReviewService(ctx: AppContext): ReviewService {
       confidence: note.confidence as Confidence,
       owner: note.owner,
       sources,
+      scope: note.scope,
     });
+    const { scopeReviewerBypass } = policy.assertApprovalAuthorized({ authorActor: note.created_by, scope: note.scope });
 
     const now = new Date().toISOString();
+    const metadata = decisionMetadata(scopeReviewerBypass);
     const runApprove = db.transaction(() => {
       const beforeSnapshot = buildNoteSnapshot(db, note);
       const reviewDueAt = policy.computeReviewDueAt(now);
@@ -594,6 +605,7 @@ export function createReviewService(ctx: AppContext): ReviewService {
         reason: reason ?? null,
         beforeSnapshot,
         afterSnapshot: buildNoteSnapshot(db, updated),
+        metadata,
       });
       return rowToNote(updated);
     });
@@ -662,6 +674,11 @@ export function createReviewService(ctx: AppContext): ReviewService {
       });
     }
 
+    // Authorization is checked before the version pre-check below: an unauthorized actor
+    // should be rejected outright, not steered toward a needs_rebase/version_conflict
+    // response that implies "resubmit and it'll work".
+    const { scopeReviewerBypass } = policy.assertApprovalAuthorized({ authorActor: proposal.proposed_by, scope: note.scope });
+
     // Cheap pre-check for the common case: skip building effective/policyWarnings and
     // opening a transaction when it's already obviously stale. This alone is NOT the
     // correctness guard (TOCTOU: another process -- e.g. the MCP server and a CLI
@@ -682,9 +699,11 @@ export function createReviewService(ctx: AppContext): ReviewService {
       owner: note.owner,
       sources: proposalSources,
       noteReviewDueAt: note.review_due_at,
+      scope: note.scope,
     });
 
     const now = new Date().toISOString();
+    const metadata = decisionMetadata(scopeReviewerBypass);
     const runApprove = db.transaction(() => {
       const beforeSnapshot = buildNoteSnapshot(db, note);
       const reviewDueAt = policy.computeReviewDueAt(now);
@@ -737,6 +756,7 @@ export function createReviewService(ctx: AppContext): ReviewService {
         reason: reason ?? null,
         beforeSnapshot: { proposal },
         afterSnapshot: { proposal: updatedProposal },
+        metadata,
       });
       history.record({
         entityType: "note",
@@ -748,6 +768,7 @@ export function createReviewService(ctx: AppContext): ReviewService {
         reason: reason ?? null,
         beforeSnapshot,
         afterSnapshot: buildNoteSnapshot(db, updatedNote),
+        metadata,
       });
 
       const others = db
@@ -849,7 +870,10 @@ export function createReviewService(ctx: AppContext): ReviewService {
       markArchiveRecommendationNeedsRebaseAndThrow(proposal, note, reason);
     }
 
+    const { scopeReviewerBypass } = policy.assertApprovalAuthorized({ authorActor: proposal.proposed_by, scope: note.scope });
+
     const now = new Date().toISOString();
+    const metadata = decisionMetadata(scopeReviewerBypass);
     const runApprove = db.transaction(() => {
       const beforeSnapshot = buildNoteSnapshot(db, note);
       const updatedNote: NoteRow = { ...note, status: "archived", archived_at: now, updated_at: now };
@@ -877,6 +901,7 @@ export function createReviewService(ctx: AppContext): ReviewService {
         reason: reason ?? proposal.reason,
         beforeSnapshot,
         afterSnapshot: buildNoteSnapshot(db, updatedNote),
+        metadata,
       });
       history.record({
         entityType: "proposal",
@@ -888,6 +913,7 @@ export function createReviewService(ctx: AppContext): ReviewService {
         reason: reason ?? null,
         beforeSnapshot: { proposal },
         afterSnapshot: { proposal: updatedProposal },
+        metadata,
       });
 
       const others = db
@@ -941,6 +967,7 @@ export function createReviewService(ctx: AppContext): ReviewService {
       });
     }
     const now = new Date().toISOString();
+    const metadata = decisionMetadata(false);
     const runReject = db.transaction(() => {
       const beforeSnapshot = buildNoteSnapshot(db, note);
       const updated: NoteRow = { ...note, status: "rejected", rejection_reason: reason, updated_at: now };
@@ -957,6 +984,7 @@ export function createReviewService(ctx: AppContext): ReviewService {
         reason,
         beforeSnapshot,
         afterSnapshot: buildNoteSnapshot(db, updated),
+        metadata,
       });
       return rowToNote(updated);
     });
@@ -975,6 +1003,7 @@ export function createReviewService(ctx: AppContext): ReviewService {
     }
     const note = getNoteRow(db, proposal.note_id);
     const now = new Date().toISOString();
+    const metadata = decisionMetadata(false);
     const runReject = db.transaction(() => {
       const updated: ProposalRow = { ...proposal, status: "rejected", rejection_reason: reason, reviewed_by: actor, reviewed_at: now };
       db.prepare(
@@ -990,6 +1019,7 @@ export function createReviewService(ctx: AppContext): ReviewService {
         reason,
         beforeSnapshot: { proposal },
         afterSnapshot: { proposal: updated },
+        metadata,
       });
       return rowToProposal(updated);
     });
